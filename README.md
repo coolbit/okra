@@ -94,6 +94,29 @@ Okra supports bracket indexing like `arr[0]` and it also supports **index expres
 | `len` | `len(x) -> int64`; `len() -> 0` | `slice` / `string` / `map` (other types return `0`) | `len(tags)`, `len()` | `int64(2)`, `0` |
 | `now` | `now() -> int64` | none | `now()` | Unix seconds |
 
+## Custom Functions (`RegisterFunc`)
+
+You can extend (or override) functions on a **single Engine instance**:
+
+- Registration is not global.
+- It only affects the current `Engine`.
+
+```go
+e := core.NewEngine()
+
+_ = e.RegisterFunc("add", func(args []any) (any, error) {
+    if len(args) != 2 {
+        return nil, fmt.Errorf("expected 2 args")
+    }
+    a, _ := args[0].(int64)
+    b, _ := args[1].(int64)
+    return a + b, nil
+})
+
+v, err := e.Eval("add(1, 2)", nil)
+// v == int64(3)
+```
+
 ## Operators and Type Coercion
 
 Okra uses three internal coercions:

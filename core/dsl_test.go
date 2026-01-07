@@ -524,6 +524,77 @@ func TestCoverage_EdgeCases(t *testing.T) {
 		}
 	})
 
+	t.Run("Engine RegisterFunc", func(t *testing.T) {
+		engine := NewEngine()
+		err := engine.RegisterFunc("add", func(args []any) (any, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("expected 2 args")
+			}
+			a, ok := toInt64(args[0])
+			if !ok {
+				return nil, fmt.Errorf("bad arg")
+			}
+			b, ok := toInt64(args[1])
+			if !ok {
+				return nil, fmt.Errorf("bad arg")
+			}
+			return a + b, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err := engine.Eval("add(1, 2)", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res != int64(3) {
+			t.Fatalf("expected 3, got %v", res)
+		}
+
+		// override built-in on current engine only
+		err = engine.RegisterFunc("len", func(args []any) (any, error) { return int64(123), nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		res, err = engine.Eval("len(tags)", map[string]any{"tags": []int{1, 2}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res != int64(123) {
+			t.Fatalf("expected 123, got %v", res)
+		}
+
+		engine2 := NewEngine()
+		res, err = engine2.Eval("len(tags)", map[string]any{"tags": []int{1, 2}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res != int64(2) {
+			t.Fatalf("expected 2, got %v", res)
+		}
+
+		// validation
+		if err := engine.RegisterFunc("", func(args []any) (any, error) { return nil, nil }); err == nil {
+			t.Fatal("expected error")
+		}
+		if err := engine.RegisterFunc("x", nil); err == nil {
+			t.Fatal("expected error")
+		}
+
+		// lazy init for zero Engine
+		var zero Engine
+		if err := zero.RegisterFunc("one", func(args []any) (any, error) { return int64(1), nil }); err != nil {
+			t.Fatal(err)
+		}
+		res, err = zero.Eval("one()", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res != int64(1) {
+			t.Fatalf("expected 1, got %v", res)
+		}
+	})
+
 	t.Run("Engine Eval recovers panic", func(t *testing.T) {
 		engine := NewEngine()
 		_, err := engine.Eval("p.Boom()", map[string]any{"p": &panicObj{}})

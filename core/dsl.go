@@ -955,9 +955,8 @@ func lbp(t token) int {
 
 type Engine struct{ funcs atomic.Value }
 
-func NewEngine() *Engine {
-	e := &Engine{}
-	e.funcs.Store(map[string]CustomFunc{
+func defaultFuncs() map[string]CustomFunc {
+	return map[string]CustomFunc{
 		"len": func(args []any) (any, error) {
 			if len(args) == 0 {
 				return 0, nil
@@ -969,8 +968,40 @@ func NewEngine() *Engine {
 			return int64(0), nil
 		},
 		"now": func(args []any) (any, error) { return time.Now().Unix(), nil },
-	})
+	}
+}
+
+func (e *Engine) loadFuncs() (m map[string]CustomFunc) {
+	defer func() {
+		if recover() != nil {
+			m = defaultFuncs()
+			e.funcs.Store(m)
+		}
+	}()
+	return e.funcs.Load().(map[string]CustomFunc)
+}
+
+func NewEngine() *Engine {
+	e := &Engine{}
+	e.funcs.Store(defaultFuncs())
 	return e
+}
+
+func (e *Engine) RegisterFunc(name string, fn CustomFunc) error {
+	if name == "" {
+		return errors.New("func name cannot be empty")
+	}
+	if fn == nil {
+		return errors.New("func cannot be nil")
+	}
+	curr := e.loadFuncs()
+	next := make(map[string]CustomFunc, len(curr)+1)
+	for k, v := range curr {
+		next[k] = v
+	}
+	next[name] = fn
+	e.funcs.Store(next)
+	return nil
 }
 
 func (e *Engine) Eval(exprStr string, data any) (res any, err error) {
@@ -992,7 +1023,7 @@ func (e *Engine) Eval(exprStr string, data any) (res any, err error) {
 	if p.curr.typ != tEOF {
 		return nil, fmt.Errorf("unexpected token %q at %d", p.curr.val, p.curr.pos)
 	}
-	return ast.Eval(Context{Data: data, Fns: e.funcs.Load().(map[string]CustomFunc)})
+	return ast.Eval(Context{Data: data, Fns: e.loadFuncs()})
 }
 
 func toInt64(v any) (int64, bool) {
