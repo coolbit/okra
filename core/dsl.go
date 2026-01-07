@@ -25,6 +25,34 @@ type Context struct {
 	Fns  map[string]CustomFunc
 }
 
+func evalBitwise(lv, rv any, op string) (any, error) {
+	li, okL := toInt64(lv)
+	ri, okR := toInt64(rv)
+	if !okL || !okR {
+		return nil, fmt.Errorf("invalid bitwise op %s between %T and %T", op, lv, rv)
+	}
+	switch op {
+	case "&":
+		return li & ri, nil
+	case "|":
+		return li | ri, nil
+	case "^":
+		return li ^ ri, nil
+	case "<<":
+		if ri < 0 {
+			return nil, errors.New("negative shift count")
+		}
+		return li << uint64(ri), nil
+	case ">>":
+		if ri < 0 {
+			return nil, errors.New("negative shift count")
+		}
+		return li >> uint64(ri), nil
+	default:
+		return nil, fmt.Errorf("unknown bitwise operator %q", op)
+	}
+}
+
 type Expr interface {
 	Eval(ctx Context) (any, error)
 	String() string
@@ -113,6 +141,84 @@ func (e *MemberAccessExpr) String() string {
 		return fmt.Sprintf("%s[%s]", e.Left.String(), e.Key)
 	}
 	return fmt.Sprintf("%s.%s", e.Left.String(), e.Key)
+}
+
+type IndexExpr struct {
+	Left  Expr
+	Index Expr
+}
+
+func (e *IndexExpr) Eval(ctx Context) (any, error) {
+	obj, err := e.Left.Eval(ctx)
+	if err != nil || obj == nil {
+		return nil, err
+	}
+	idx, err := e.Index.Eval(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	rv := reflect.ValueOf(obj)
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return nil, nil
+		}
+		rv = rv.Elem()
+	}
+
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		i, ok := toInt64(idx)
+		if !ok {
+			return nil, nil
+		}
+		if i < 0 || i >= int64(rv.Len()) {
+			return nil, nil
+		}
+		return rv.Index(int(i)).Interface(), nil
+	case reflect.Map:
+		kt := rv.Type().Key()
+		var kv reflect.Value
+		if idx == nil {
+			kv = reflect.Zero(kt)
+		} else {
+			v := reflect.ValueOf(idx)
+			if v.Type().AssignableTo(kt) {
+				kv = v
+			} else if v.Type().ConvertibleTo(kt) {
+				kv = v.Convert(kt)
+			} else if s, ok := idx.(string); ok {
+				switch kt.Kind() {
+				case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+					if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+						kv = reflect.ValueOf(i).Convert(kt)
+					} else {
+						return nil, nil
+					}
+				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+					if u, err := strconv.ParseUint(s, 10, 64); err == nil {
+						kv = reflect.ValueOf(u).Convert(kt)
+					} else {
+						return nil, nil
+					}
+				default:
+					return nil, nil
+				}
+			} else {
+				return nil, nil
+			}
+		}
+		res := rv.MapIndex(kv)
+		if !res.IsValid() {
+			return nil, nil
+		}
+		return res.Interface(), nil
+	}
+	return nil, nil
+}
+
+func (e *IndexExpr) String() string {
+	return fmt.Sprintf("%s[%s]", e.Left.String(), e.Index.String())
 }
 
 type MethodCallExpr struct {
@@ -207,6 +313,42 @@ func (e *CallExpr) String() string {
 	return fmt.Sprintf("%s(%s)", e.Name, strings.Join(args, ", "))
 }
 
+type UnaryExpr struct {
+	Op    string
+	Right Expr
+}
+
+func (e *UnaryExpr) Eval(ctx Context) (any, error) {
+	rv, err := e.Right.Eval(ctx)
+	if err != nil {
+		return nil, err
+	}
+	switch e.Op {
+	case "!":
+		return !toBool(rv), nil
+	case "-":
+		if i, ok := toInt64(rv); ok {
+			return -i, nil
+		}
+		if f, ok := toFloat(rv); ok {
+			return -f, nil
+		}
+		return nil, fmt.Errorf("invalid unary - for %T", rv)
+	case "~":
+		i, ok := toInt64(rv)
+		if !ok {
+			return nil, fmt.Errorf("invalid unary ~ for %T", rv)
+		}
+		return ^i, nil
+	default:
+		return nil, fmt.Errorf("unknown unary operator %q", e.Op)
+	}
+}
+
+func (e *UnaryExpr) String() string {
+	return fmt.Sprintf("(%s%s)", e.Op, e.Right.String())
+}
+
 type InfixExpr struct {
 	Left  Expr
 	Op    string
@@ -278,11 +420,34 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 		return evalMath(lv, rv, '%')
 	case ">", "<", ">=", "<=":
 		return compare(lv, rv, e.Op)
+	case "&", "|", "^", "<<", ">>":
+		return evalBitwise(lv, rv, e.Op)
 	}
 	return nil, nil
 }
 func (e *InfixExpr) String() string {
 	return fmt.Sprintf("(%s %s %s)", e.Left.String(), e.Op, e.Right.String())
+}
+
+type TernaryExpr struct {
+	Cond Expr
+	Then Expr
+	Else Expr
+}
+
+func (e *TernaryExpr) Eval(ctx Context) (any, error) {
+	cond, err := e.Cond.Eval(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if toBool(cond) {
+		return e.Then.Eval(ctx)
+	}
+	return e.Else.Eval(ctx)
+}
+
+func (e *TernaryExpr) String() string {
+	return fmt.Sprintf("(%s ? %s : %s)", e.Cond.String(), e.Then.String(), e.Else.String())
 }
 
 // -----------------------------------------------------------------------------
@@ -342,8 +507,14 @@ func getMember(obj any, key string) (any, error) {
 func callReflectMethod(obj any, name string, args []any) (any, error) {
 	rv := reflect.ValueOf(obj)
 	mv := rv.MethodByName(name)
-	if !mv.IsValid() && rv.CanAddr() {
-		mv = rv.Addr().MethodByName(name)
+	if !mv.IsValid() {
+		if rv.Kind() != reflect.Ptr {
+			// If obj is a non-pointer value held in an interface, it is not addressable.
+			// Create an addressable copy so we can still call pointer-receiver methods.
+			addr := reflect.New(rv.Type())
+			addr.Elem().Set(rv)
+			mv = addr.MethodByName(name)
+		}
 	}
 	if !mv.IsValid() {
 		return nil, fmt.Errorf("method %s not found on %T", name, obj)
@@ -522,19 +693,33 @@ func (l *lexer) nextToken() (token, error) {
 		var sb strings.Builder
 		for l.pos < len(l.s) {
 			curr := l.s[l.pos]
-			l.pos++
 			if curr == q {
+				l.pos++
 				return token{tString, sb.String(), start}, nil
 			}
+			if curr == '\\' {
+				if l.pos+1 < len(l.s) && l.s[l.pos+1] == q {
+					sb.WriteByte(q)
+					l.pos += 2
+					continue
+				}
+				val, _, tail, err := strconv.UnquoteChar(l.s[l.pos:], byte(q))
+				if err != nil {
+					return token{}, err
+				}
+				consumed := len(l.s[l.pos:]) - len(tail)
+				l.pos += consumed
+				sb.WriteRune(val)
+				continue
+			}
+			l.pos++
 			sb.WriteByte(curr)
 		}
 		return token{}, errors.New("unterminated string")
 	case r == '[':
-		for l.pos < len(l.s) && l.s[l.pos] != ']' {
-			l.pos++
-		}
-		l.pos++
-		return token{tPathKey, l.s[start+1 : l.pos-1], start}, nil
+		return token{tOp, "[", start}, nil
+	case r == ']':
+		return token{tOp, "]", start}, nil
 	case r == '(':
 		return token{tLParen, "(", start}, nil
 	case r == ')':
@@ -544,7 +729,7 @@ func (l *lexer) nextToken() (token, error) {
 	case r == '.':
 		return token{tOp, ".", start}, nil
 	default:
-		ops := []string{"==", "!=", "<=", ">=", "&&", "||"}
+		ops := []string{"==", "!=", "<=", ">=", "&&", "||", "<<", ">>"}
 		for _, op := range ops {
 			if strings.HasPrefix(l.s[start:], op) {
 				l.pos = start + len(op)
@@ -556,14 +741,24 @@ func (l *lexer) nextToken() (token, error) {
 }
 
 type parser struct {
-	lex  *lexer
-	curr token
-	next token
+	lex    *lexer
+	curr   token
+	next   token
+	lexErr error
 }
 
 func (p *parser) advance() {
 	p.curr = p.next
-	n, _ := p.lex.nextToken()
+	if p.lexErr != nil {
+		p.next = token{tEOF, "", p.lex.pos}
+		return
+	}
+	n, err := p.lex.nextToken()
+	if err != nil {
+		p.lexErr = err
+		p.next = token{tEOF, "", p.lex.pos}
+		return
+	}
 	p.next = n
 }
 
@@ -571,8 +766,14 @@ func (p *parser) parse(rbp int, depth int) (Expr, error) {
 	if depth > MaxStackDepth {
 		return nil, errors.New("stack overflow")
 	}
+	if p.lexErr != nil {
+		return nil, p.lexErr
+	}
 	t := p.curr
 	p.advance()
+	if p.lexErr != nil {
+		return nil, p.lexErr
+	}
 	left, err := p.nud(t, depth)
 	if err != nil {
 		return nil, err
@@ -580,6 +781,9 @@ func (p *parser) parse(rbp int, depth int) (Expr, error) {
 	for rbp < lbp(p.curr) {
 		t = p.curr
 		p.advance()
+		if p.lexErr != nil {
+			return nil, p.lexErr
+		}
 		left, err = p.led(t, left, depth)
 		if err != nil {
 			return nil, err
@@ -625,15 +829,63 @@ func (p *parser) nud(t token, depth int) (Expr, error) {
 		}
 		p.advance()
 		return e, nil
+	case tOp:
+		switch t.val {
+		case "!", "-", "~":
+			right, err := p.parse(60, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			return &UnaryExpr{Op: t.val, Right: right}, nil
+		default:
+			return nil, fmt.Errorf("unexpected token %s", t.val)
+		}
 	default:
 		return nil, fmt.Errorf("unexpected token %s", t.val)
 	}
 }
 
 func (p *parser) led(t token, left Expr, depth int) (Expr, error) {
+	if t.val == "?" {
+		thenExpr, err := p.parse(0, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		if p.curr.typ != tOp || p.curr.val != ":" {
+			return nil, fmt.Errorf("missing : in ternary expression at position %d", p.curr.pos)
+		}
+		p.advance()
+		elseExpr, err := p.parse(lbp(t)-1, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		return &TernaryExpr{Cond: left, Then: thenExpr, Else: elseExpr}, nil
+	}
+	if t.val == "[" {
+		idxExpr, err := p.parse(0, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		if p.curr.typ != tOp || p.curr.val != "]" {
+			return nil, fmt.Errorf("missing ] in index expression at position %d", p.curr.pos)
+		}
+		p.advance()
+		return &IndexExpr{Left: left, Index: idxExpr}, nil
+	}
 	if t.val == "." {
+		if p.curr.typ == tOp && p.curr.val == "[" {
+			p.advance()
+			idxExpr, err := p.parse(0, depth+1)
+			if err != nil {
+				return nil, err
+			}
+			if p.curr.typ != tOp || p.curr.val != "]" {
+				return nil, fmt.Errorf("missing ] in index expression at position %d", p.curr.pos)
+			}
+			p.advance()
+			return &IndexExpr{Left: left, Index: idxExpr}, nil
+		}
 		member := p.curr.val
-		isIndex := p.curr.typ == tPathKey
 		p.advance()
 		if p.curr.typ == tLParen {
 			p.advance()
@@ -643,7 +895,7 @@ func (p *parser) led(t token, left Expr, depth int) (Expr, error) {
 			}
 			return &MethodCallExpr{Left: left, Method: member, Args: args}, nil
 		}
-		return &MemberAccessExpr{Left: left, Key: member, IsIndex: isIndex}, nil
+		return &MemberAccessExpr{Left: left, Key: member}, nil
 	}
 	right, err := p.parse(lbp(t), depth+1)
 	return &InfixExpr{Left: left, Op: t.val, Right: right}, err
@@ -674,9 +926,11 @@ func lbp(t token) int {
 		switch t.val {
 		case ".":
 			return 100
-		case "*", "/", "%":
+		case "[":
+			return 100
+		case "*", "/", "%", "<<", ">>", "&":
 			return 50
-		case "+", "-":
+		case "+", "-", "|", "^":
 			return 40
 		case "<", ">", "<=", ">=":
 			return 35
@@ -686,6 +940,8 @@ func lbp(t token) int {
 			return 20
 		case "||":
 			return 10
+		case "?":
+			return 5
 		}
 	default:
 		return 0
@@ -717,7 +973,14 @@ func NewEngine() *Engine {
 	return e
 }
 
-func (e *Engine) Eval(exprStr string, data any) (any, error) {
+func (e *Engine) Eval(exprStr string, data any) (res any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+			res = nil
+		}
+	}()
+
 	l := &lexer{s: exprStr}
 	p := &parser{lex: l}
 	p.advance()
@@ -792,20 +1055,34 @@ func EvalTo[T any](e *Engine, exprStr string, data any) (T, error) {
 	// 2. Handle numeric conversions (e.g., int64 from engine to int in T)
 	rv := reflect.ValueOf(raw)
 	targetType := reflect.TypeOf(zero)
-
-	if rv.IsValid() && rv.Type().ConvertibleTo(targetType) {
-		return rv.Convert(targetType).Interface().(T), nil
+	if targetType == nil {
+		return zero, fmt.Errorf("target type cannot be nil")
 	}
 
-	// 3. Fallback for mixed numeric types (e.g., float64 to int)
-	// This uses your existing toFloat/toInt64 logic to be more flexible
-	if targetType.Kind() == reflect.Int {
-		if i, ok := toInt64(raw); ok {
-			return any(int(i)).(T), nil
+	// For non-numeric types, use reflect conversion if possible.
+	// Numeric conversions are handled below to keep behavior flexible (e.g., string->float via toFloat).
+	if rv.IsValid() && rv.Type().ConvertibleTo(targetType) {
+		switch targetType.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Float32, reflect.Float64:
+			// handled below
+		default:
+			return rv.Convert(targetType).Interface().(T), nil
 		}
-	} else if targetType.Kind() == reflect.Float64 {
+	}
+
+	// 3. Fallback for numeric conversions.
+	switch targetType.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if i, ok := toInt64(raw); ok {
+			return reflect.ValueOf(i).Convert(targetType).Interface().(T), nil
+		}
 		if f, ok := toFloat(raw); ok {
-			return any(f).(T), nil
+			return reflect.ValueOf(int64(f)).Convert(targetType).Interface().(T), nil
+		}
+	case reflect.Float32, reflect.Float64:
+		if f, ok := toFloat(raw); ok {
+			return reflect.ValueOf(f).Convert(targetType).Interface().(T), nil
 		}
 	}
 
