@@ -235,7 +235,7 @@ A `Program` always reads the Engine's latest registered functions, so `RegisterF
 ### Inspecting a Program
 
 - `prog.Vars() []string` — the distinct **root** variable identifiers the program reads (the base of each access chain, so `user.Age` reports `user`, not the full path `user.Age`). Useful for validating which top-level objects a rule needs, or building dependency indexes, before running it.
-- `prog.Funcs() []string` — the distinct function names the program calls.
+- `prog.Funcs() []string` — the distinct function and method names the program calls (bare calls like `contains(...)` and method calls like `user.Save()`).
 
 ```go
 prog, _ := e.Compile("user.Age > 18 && contains(user.Name, 'a')")

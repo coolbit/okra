@@ -196,17 +196,29 @@ func getStructMeta(t reflect.Type) structMeta {
 type LiteralExpr struct{ Value any }
 
 func (e *LiteralExpr) Eval(ctx Context) (any, error) { return e.Value, nil }
-func (e *LiteralExpr) String() string {
-	if s, ok := e.Value.(string); ok {
-		// Emit okra's single-quoted string syntax so String() round-trips
-		// back through ParseExpr. strconv.Quote gives a double-quoted Go
-		// literal; swap the delimiters and fix the escaped quotes.
-		q := strconv.Quote(s)
+func (e *LiteralExpr) String() string { return renderLiteral(e.Value) }
+
+// renderLiteral formats a value back into okra source syntax so String()
+// round-trips through ParseExpr, including strings (single-quoted) and lists
+// produced by constant folding.
+func renderLiteral(v any) string {
+	switch x := v.(type) {
+	case string:
+		// strconv.Quote gives a double-quoted Go literal; swap the delimiters
+		// and fix the escaped quotes to produce okra's single-quoted form.
+		q := strconv.Quote(x)
 		q = strings.ReplaceAll(q[1:len(q)-1], `\"`, `"`)
 		q = strings.ReplaceAll(q, `'`, `\'`)
 		return "'" + q + "'"
+	case []any:
+		parts := make([]string, len(x))
+		for i, el := range x {
+			parts[i] = renderLiteral(el)
+		}
+		return "[" + strings.Join(parts, ", ") + "]"
+	default:
+		return fmt.Sprint(v)
 	}
-	return fmt.Sprint(e.Value)
 }
 
 type ListExpr struct{ Elems []Expr }
@@ -1518,12 +1530,17 @@ func (p *Program) Vars() []string {
 	return sortedKeys(set)
 }
 
-// Funcs returns the distinct function names the program calls, sorted.
+// Funcs returns the distinct function and method names the program calls,
+// sorted. This includes bare calls (CallExpr, e.g. contains(...)) and method
+// calls on data (MethodCallExpr, e.g. user.Save()).
 func (p *Program) Funcs() []string {
 	set := map[string]struct{}{}
 	walk(p.ast, func(e Expr) {
-		if c, ok := e.(*CallExpr); ok {
+		switch c := e.(type) {
+		case *CallExpr:
 			set[c.Name] = struct{}{}
+		case *MethodCallExpr:
+			set[c.Method] = struct{}{}
 		}
 	})
 	return sortedKeys(set)

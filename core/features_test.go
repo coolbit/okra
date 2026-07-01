@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -304,6 +305,77 @@ func TestEmbeddedFields(t *testing.T) {
 	e.SetStrict(true)
 	if _, err := e.Eval("u.kind", map[string]any{"u": u2}); !errors.Is(err, ErrUnknownField) {
 		t.Fatalf("nil embedded ptr (strict): expected ErrUnknownField, got %v", err)
+	}
+}
+
+// --- folded list String() round-trips -------------------------------------------
+
+func TestFoldedListRoundTrip(t *testing.T) {
+	ast, err := ParseExpr("x in [1, 'a', 2]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	folded := foldConstants(ast) // the list literal folds to a []any literal
+	s := folded.String()
+	// The rendered form must parse again and evaluate identically.
+	if _, err := ParseExpr(s); err != nil {
+		t.Fatalf("folded String() %q does not round-trip: %v", s, err)
+	}
+	e := NewEngine()
+	data := map[string]any{"x": "a"}
+	v1, _ := e.Eval("x in [1, 'a', 2]", data)
+	v2, _ := e.Eval(s, data)
+	if v1 != true || v2 != v1 {
+		t.Fatalf("round-trip mismatch: %v vs %v (rendered %q)", v1, v2, s)
+	}
+}
+
+// --- Funcs() includes method calls ----------------------------------------------
+
+func TestFuncsIncludesMethods(t *testing.T) {
+	e := NewEngine()
+	prog, err := e.Compile("contains(user.Name, 'a') && user.IsActive()")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := prog.Funcs()
+	want := map[string]bool{"contains": true, "IsActive": true}
+	if len(got) != 2 || !want[got[0]] || !want[got[1]] {
+		t.Fatalf("Funcs() = %v, want contains+IsActive", got)
+	}
+}
+
+// --- concurrency: a compiled Program is safe for concurrent Eval ----------------
+
+func TestConcurrentEval(t *testing.T) {
+	e := NewEngine()
+	prog, err := e.Compile("a * b + a - b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const workers = 50
+	done := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		go func(n int64) {
+			var lastErr error
+			for i := 0; i < 1000; i++ {
+				v, err := prog.Eval(map[string]any{"a": n, "b": int64(2)})
+				if err != nil {
+					lastErr = err
+					break
+				}
+				if v != n*2+n-2 {
+					lastErr = fmt.Errorf("got %v for a=%d", v, n)
+					break
+				}
+			}
+			done <- lastErr
+		}(int64(w + 1))
+	}
+	for w := 0; w < workers; w++ {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
