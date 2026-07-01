@@ -603,7 +603,7 @@ func TestCoverage_EdgeCases(t *testing.T) {
 
 	t.Run("Engine Eval top-level recover", func(t *testing.T) {
 		engine := NewEngine()
-		// getMember(map[bool]...) will panic when trying to Convert(int64 -> bool) for numeric key access.
+		// getMember(Context{}, map[bool]...) will panic when trying to Convert(int64 -> bool) for numeric key access.
 		_, err := engine.Eval("m.1", map[string]any{"m": map[bool]string{true: "t"}})
 		if err == nil {
 			t.Fatal("expected error")
@@ -1087,40 +1087,40 @@ func TestCoverage_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("getMember branches", func(t *testing.T) {
-		if v, _ := getMember(nil, "x"); v != nil {
+		if v, _ := getMember(Context{}, nil, "x"); v != nil {
 			t.Fatalf("expected nil, got %v", v)
 		}
 		m := map[int]string{1: "one"}
-		if v, _ := getMember(m, "abc"); v != nil {
+		if v, _ := getMember(Context{}, m, "abc"); v != nil {
 			t.Fatalf("expected nil, got %v", v)
 		}
-		if v, _ := getMember([]int{1}, "5"); v != nil {
+		if v, _ := getMember(Context{}, []int{1}, "5"); v != nil {
 			t.Fatalf("expected nil, got %v", v)
 		}
 		u := TestUser{Name: "A", Age: 1}
-		if v, _ := getMember(u, "SayHi"); v != nil {
+		if v, _ := getMember(Context{}, u, "SayHi"); v != nil {
 			t.Fatalf("expected nil, got %v", v)
 		}
-		if v, _ := getMember(u, "PointerMethod"); v != nil {
+		if v, _ := getMember(Context{}, u, "PointerMethod"); v != nil {
 			t.Fatalf("expected nil, got %v", v)
 		}
-		if v, _ := getMember(u, "MultiReturn"); v != "ok" {
+		if v, _ := getMember(Context{}, u, "MultiReturn"); v != "ok" {
 			t.Fatalf("expected ok, got %v", v)
 		}
 		m2 := map[string]int{"a": 1}
-		if v, _ := getMember(m2, "a"); v != 1 {
+		if v, _ := getMember(Context{}, m2, "a"); v != 1 {
 			t.Fatalf("expected 1, got %v", v)
 		}
-		if v, _ := getMember(m2, "b"); v != nil {
+		if v, _ := getMember(Context{}, m2, "b"); v != nil {
 			t.Fatalf("expected nil, got %v", v)
 		}
-		if v, _ := getMember([]int{1}, "x"); v != nil {
+		if v, _ := getMember(Context{}, []int{1}, "x"); v != nil {
 			t.Fatalf("expected nil, got %v", v)
 		}
-		if v, _ := getMember(u, "DoesNotExist"); v != nil {
+		if v, _ := getMember(Context{}, u, "DoesNotExist"); v != nil {
 			t.Fatalf("expected nil, got %v", v)
 		}
-		if v, _ := getMember(&u, "PointerMethod"); v != "pointer" {
+		if v, _ := getMember(Context{}, &u, "PointerMethod"); v != "pointer" {
 			t.Fatalf("expected pointer, got %v", v)
 		}
 	})

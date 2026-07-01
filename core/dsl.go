@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,12 @@ var (
 	ErrFloatModulo   = errors.New("float modulo not supported")
 	ErrNegativeShift = errors.New("negative shift count")
 	ErrNotFound      = errors.New("function or method not found")
+	// ErrUnknownField is returned in strict mode for a missing struct field,
+	// map key, or out-of-range/nil access.
+	ErrUnknownField = errors.New("unknown field or key")
+	// ErrMethodDenied is returned when a method/getter call is blocked by the
+	// Engine's method filter.
+	ErrMethodDenied = errors.New("method not permitted")
 )
 
 // -----------------------------------------------------------------------------
@@ -39,6 +46,27 @@ type CustomFunc func(args []any) (any, error)
 type Context struct {
 	Data any
 	Fns  map[string]CustomFunc
+	// Strict makes member/index access on a missing field, key, index, or nil
+	// value return an error instead of nil. Off by default.
+	Strict bool
+	// MethodFilter, when non-nil, gates every reflected method and getter
+	// invocation: names for which it returns false are denied. Nil allows all.
+	MethodFilter func(name string) bool
+}
+
+// methodAllowed reports whether calling the named method/getter is permitted.
+func (c Context) methodAllowed(name string) bool {
+	return c.MethodFilter == nil || c.MethodFilter(name)
+}
+
+// miss handles a lookup that found nothing: in strict mode it is an error
+// (wrapping ErrUnknownField); otherwise it resolves to nil like Go's zero-value
+// lookups.
+func (c Context) miss(format string, args ...any) (any, error) {
+	if c.Strict {
+		return nil, fmt.Errorf("%s: %w", fmt.Sprintf(format, args...), ErrUnknownField)
+	}
+	return nil, nil
 }
 
 func evalBitwise(lv, rv any, op string) (any, error) {
@@ -167,7 +195,7 @@ func (e *ListExpr) String() string {
 type VariableExpr struct{ Name string }
 
 func (e *VariableExpr) Eval(ctx Context) (any, error) {
-	return getMember(ctx.Data, e.Name)
+	return getMember(ctx, ctx.Data, e.Name)
 }
 func (e *VariableExpr) String() string { return e.Name }
 
@@ -178,10 +206,13 @@ type MemberAccessExpr struct {
 
 func (e *MemberAccessExpr) Eval(ctx Context) (any, error) {
 	val, err := e.Left.Eval(ctx)
-	if err != nil || val == nil {
+	if err != nil {
 		return nil, err
 	}
-	return getMember(val, e.Key)
+	if val == nil {
+		return ctx.miss("cannot access %q on nil", e.Key)
+	}
+	return getMember(ctx, val, e.Key)
 }
 func (e *MemberAccessExpr) String() string {
 	return fmt.Sprintf("%s.%s", e.Left.String(), e.Key)
@@ -194,8 +225,11 @@ type IndexExpr struct {
 
 func (e *IndexExpr) Eval(ctx Context) (any, error) {
 	obj, err := e.Left.Eval(ctx)
-	if err != nil || obj == nil {
+	if err != nil {
 		return nil, err
+	}
+	if obj == nil {
+		return ctx.miss("cannot index nil")
 	}
 	idx, err := e.Index.Eval(ctx)
 	if err != nil {
@@ -205,7 +239,7 @@ func (e *IndexExpr) Eval(ctx Context) (any, error) {
 	rv := reflect.ValueOf(obj)
 	for rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
-			return nil, nil
+			return ctx.miss("cannot index nil")
 		}
 		rv = rv.Elem()
 	}
@@ -214,10 +248,10 @@ func (e *IndexExpr) Eval(ctx Context) (any, error) {
 	case reflect.Slice, reflect.Array:
 		i, ok := toInt64(idx)
 		if !ok {
-			return nil, nil
+			return ctx.miss("non-integer index %v", idx)
 		}
 		if i < 0 || i >= int64(rv.Len()) {
-			return nil, nil
+			return ctx.miss("index %d out of range (len %d)", i, rv.Len())
 		}
 		return rv.Index(int(i)).Interface(), nil
 	case reflect.Map:
@@ -237,28 +271,28 @@ func (e *IndexExpr) Eval(ctx Context) (any, error) {
 					if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 						kv = reflect.ValueOf(i).Convert(kt)
 					} else {
-						return nil, nil
+						return ctx.miss("invalid map key %q", s)
 					}
 				case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 					if u, err := strconv.ParseUint(s, 10, 64); err == nil {
 						kv = reflect.ValueOf(u).Convert(kt)
 					} else {
-						return nil, nil
+						return ctx.miss("invalid map key %q", s)
 					}
 				default:
-					return nil, nil
+					return ctx.miss("invalid map key %v", idx)
 				}
 			} else {
-				return nil, nil
+				return ctx.miss("invalid map key %v", idx)
 			}
 		}
 		res := rv.MapIndex(kv)
 		if !res.IsValid() {
-			return nil, nil
+			return ctx.miss("map has no key %v", idx)
 		}
 		return res.Interface(), nil
 	}
-	return nil, nil
+	return ctx.miss("cannot index %T", obj)
 }
 
 func (e *IndexExpr) String() string {
@@ -289,6 +323,10 @@ func (e *MethodCallExpr) Eval(ctx Context) (any, error) {
 		if k == reflect.Slice || k == reflect.Array || k == reflect.Map || k == reflect.String {
 			return int64(rv.Len()), nil
 		}
+	}
+
+	if !ctx.methodAllowed(e.Method) {
+		return nil, fmt.Errorf("%q: %w", e.Method, ErrMethodDenied)
 	}
 
 	args := make([]any, len(e.Args))
@@ -333,6 +371,9 @@ func (e *CallExpr) Eval(ctx Context) (any, error) {
 	// through to "not found" when the method genuinely does not exist; if it
 	// exists but fails, surface that real error instead of masking it.
 	if ctx.Data != nil && hasMethod(ctx.Data, e.Name) {
+		if !ctx.methodAllowed(e.Name) {
+			return nil, fmt.Errorf("%q: %w", e.Name, ErrMethodDenied)
+		}
 		args := make([]any, len(e.Args))
 		for i, argExpr := range e.Args {
 			v, err := argExpr.Eval(ctx)
@@ -450,22 +491,51 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 		return evalBitwise(lv, rv, e.Op)
 	case "in":
 		return evalIn(lv, rv)
+	case "not in":
+		v, err := evalIn(lv, rv)
+		if err != nil {
+			return nil, err
+		}
+		return !v.(bool), nil
 	}
 	return nil, nil
 }
 
-// valuesEqual implements the loose equality used by == / != / in: exact
-// DeepEqual first, then a numeric comparison if both sides are numbers.
+// valuesEqual implements the equality used by == / != / in: exact DeepEqual
+// first, then a numeric comparison when both sides are numbers. A string is
+// never treated as numerically equal to a number (so 1 == '1' is false).
 func valuesEqual(lv, rv any) bool {
+	// Fast path for common scalar types, avoiding reflect.DeepEqual.
+	switch l := lv.(type) {
+	case string:
+		r, ok := rv.(string)
+		return ok && l == r // a string never equals a number
+	case bool:
+		r, ok := rv.(bool)
+		return ok && l == r
+	case int64:
+		if r, ok := rv.(int64); ok {
+			return l == r
+		}
+	case float64:
+		if r, ok := rv.(float64); ok {
+			return l == r
+		}
+	}
+	if isStringVal(lv) || isStringVal(rv) {
+		return false
+	}
 	if reflect.DeepEqual(lv, rv) {
 		return true
 	}
 	lf, okL := toFloat(lv)
 	rf, okR := toFloat(rv)
-	if okL && okR {
-		return lf == rf
-	}
-	return false
+	return okL && okR && lf == rf
+}
+
+func isStringVal(v any) bool {
+	_, ok := v.(string)
+	return ok
 }
 
 // evalIn implements `needle in haystack`: membership over slice/array
@@ -535,14 +605,14 @@ func (e *TernaryExpr) String() string {
 // Reflection & Math Logic
 // -----------------------------------------------------------------------------
 
-func getMember(obj any, key string) (any, error) {
+func getMember(ctx Context, obj any, key string) (any, error) {
 	if obj == nil {
-		return nil, nil
+		return ctx.miss("cannot access %q on nil", key)
 	}
 	rv := reflect.ValueOf(obj)
 	for rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
-			return nil, nil
+			return ctx.miss("cannot access %q on nil", key)
 		}
 		rv = rv.Elem()
 	}
@@ -553,18 +623,18 @@ func getMember(obj any, key string) (any, error) {
 			if i, err := strconv.ParseInt(key, 10, 64); err == nil {
 				kv = reflect.ValueOf(i).Convert(rv.Type().Key())
 			} else {
-				return nil, nil
+				return ctx.miss("map has no key %q", key)
 			}
 		}
 		res := rv.MapIndex(kv)
 		if !res.IsValid() {
-			return nil, nil
+			return ctx.miss("map has no key %q", key)
 		}
 		return res.Interface(), nil
 	case reflect.Slice, reflect.Array:
 		idx, err := strconv.Atoi(key)
 		if err != nil || idx < 0 || idx >= rv.Len() {
-			return nil, nil
+			return ctx.miss("index %q out of range (len %d)", key, rv.Len())
 		}
 		return rv.Index(idx).Interface(), nil
 	case reflect.Struct:
@@ -573,6 +643,9 @@ func getMember(obj any, key string) (any, error) {
 			return rv.Field(idx).Interface(), nil
 		}
 		if _, ok := meta.methods[key]; ok {
+			if !ctx.methodAllowed(key) {
+				return nil, fmt.Errorf("%q: %w", key, ErrMethodDenied)
+			}
 			m := rv.MethodByName(key)
 			if !m.IsValid() && rv.CanAddr() {
 				m = rv.Addr().MethodByName(key)
@@ -581,8 +654,9 @@ func getMember(obj any, key string) (any, error) {
 				return m.Call(nil)[0].Interface(), nil
 			}
 		}
+		return ctx.miss("unknown field %q on %s", key, rv.Type())
 	}
-	return nil, nil
+	return ctx.miss("cannot access %q on %T", key, obj)
 }
 
 // hasMethod reports whether obj (or its addressable pointer form) has an
@@ -722,6 +796,22 @@ func evalMath(lv, rv any, op rune) (any, error) {
 }
 
 func compare(lv, rv any, op string) (bool, error) {
+	// When both sides are strings, compare lexically. (Numeric strings still
+	// compare numerically if one side is an actual number, via toFloat below.)
+	if ls, ok := lv.(string); ok {
+		if rs, ok := rv.(string); ok {
+			switch op {
+			case ">":
+				return ls > rs, nil
+			case "<":
+				return ls < rs, nil
+			case ">=":
+				return ls >= rs, nil
+			case "<=":
+				return ls <= rs, nil
+			}
+		}
+	}
 	lf, okL := toFloat(lv)
 	rf, okR := toFloat(rv)
 	if !okL || !okR {
@@ -751,7 +841,6 @@ const (
 	tNumber
 	tString
 	tIdent
-	tPathKey
 	tLParen
 	tRParen
 	tComma
@@ -945,7 +1034,7 @@ func (p *parser) parse(rbp int, depth int) (Expr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for rbp < lbp(p.curr) {
+	for rbp < p.curLbp() {
 		t = p.curr
 		p.advance()
 		if p.lexErr != nil {
@@ -957,6 +1046,15 @@ func (p *parser) parse(rbp int, depth int) (Expr, error) {
 		}
 	}
 	return left, nil
+}
+
+// curLbp is the binding power of the current token, treating the two-word
+// `not in` operator (curr == "not", next == "in") as a single infix operator.
+func (p *parser) curLbp() int {
+	if p.curr.typ == tIdent && p.curr.val == "not" && p.next.typ == tIdent && p.next.val == "in" {
+		return lbpIn
+	}
+	return lbp(p.curr)
 }
 
 // parseNumber turns a numeric token into an int64 or float64 literal,
@@ -1051,6 +1149,18 @@ func (p *parser) nud(t token, depth int) (Expr, error) {
 }
 
 func (p *parser) led(t token, left Expr, depth int) (Expr, error) {
+	// Two-word `not in` operator: t is "not" and curr is "in".
+	if t.typ == tIdent && t.val == "not" {
+		if p.curr.typ != tIdent || p.curr.val != "in" {
+			return nil, fmt.Errorf("expected 'in' after 'not' at position %d", p.curr.pos)
+		}
+		p.advance() // consume "in"
+		right, err := p.parse(lbpIn, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		return &InfixExpr{Left: left, Op: "not in", Right: right}, nil
+	}
 	if t.val == "?" {
 		thenExpr, err := p.parse(0, depth+1)
 		if err != nil {
@@ -1125,6 +1235,10 @@ func (p *parser) parseArgs(depth int) ([]Expr, error) {
 	return args, nil
 }
 
+// lbpIn is the binding power of `in` / `not in`; it sits on the comparison
+// tier, matching how most languages treat membership.
+const lbpIn = 35
+
 func lbp(t token) int {
 	switch t.typ {
 	case tOp:
@@ -1138,7 +1252,7 @@ func lbp(t token) int {
 		case "+", "-", "|", "^":
 			return 40
 		case "<", ">", "<=", ">=":
-			return 35
+			return lbpIn
 		case "==", "!=":
 			return 30
 		case "&&":
@@ -1150,7 +1264,7 @@ func lbp(t token) int {
 		}
 	case tIdent:
 		if t.val == "in" {
-			return 33 // membership, just below the ordering comparisons
+			return lbpIn
 		}
 		return 0
 	default:
@@ -1164,9 +1278,15 @@ func lbp(t token) int {
 // -----------------------------------------------------------------------------
 
 type Engine struct {
-	funcs    atomic.Value
-	maxDepth atomic.Int64
+	funcs        atomic.Value
+	maxDepth     atomic.Int64
+	strict       atomic.Bool
+	methodFilter atomic.Value // holds methodPolicy
 }
+
+// methodPolicy wraps the optional method filter so it can live in an
+// atomic.Value (which needs a consistent concrete type and rejects nil).
+type methodPolicy struct{ fn func(name string) bool }
 
 func defaultFuncs() map[string]CustomFunc {
 	return map[string]CustomFunc{
@@ -1238,6 +1358,7 @@ func NewEngine() *Engine {
 	e := &Engine{}
 	e.funcs.Store(defaultFuncs())
 	e.maxDepth.Store(MaxStackDepth)
+	e.methodFilter.Store(methodPolicy{nil})
 	return e
 }
 
@@ -1256,6 +1377,28 @@ func (e *Engine) depthLimit() int {
 		return n
 	}
 	return MaxStackDepth
+}
+
+// SetStrict controls strict lookups: when true, accessing a missing struct
+// field, map key, out-of-range index, or a member of nil returns an error
+// (wrapping ErrUnknownField) instead of nil. Off by default. Safe to call
+// concurrently.
+func (e *Engine) SetStrict(strict bool) { e.strict.Store(strict) }
+
+// SetMethodFilter installs a predicate consulted before every reflected method
+// or getter invocation; names for which it returns false are denied with
+// ErrMethodDenied. Pass nil to allow all (the default). Safe to call
+// concurrently.
+func (e *Engine) SetMethodFilter(filter func(name string) bool) {
+	e.methodFilter.Store(methodPolicy{filter})
+}
+
+func (e *Engine) methodFilterFn() func(string) bool {
+	v := e.methodFilter.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(methodPolicy).fn
 }
 
 func (e *Engine) RegisterFunc(name string, fn CustomFunc) error {
@@ -1299,7 +1442,7 @@ func (e *Engine) Compile(exprStr string) (prog *Program, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Program{ast: ast, engine: e}, nil
+	return &Program{ast: foldConstants(ast), engine: e}, nil
 }
 
 // Eval evaluates a compiled Program against data. Evaluation panics are
@@ -1311,7 +1454,141 @@ func (p *Program) Eval(data any) (res any, err error) {
 			res = nil
 		}
 	}()
-	return p.ast.Eval(Context{Data: data, Fns: p.engine.loadFuncs()})
+	return p.ast.Eval(Context{
+		Data:         data,
+		Fns:          p.engine.loadFuncs(),
+		Strict:       p.engine.strict.Load(),
+		MethodFilter: p.engine.methodFilterFn(),
+	})
+}
+
+// Vars returns the distinct root variable/field identifiers the program reads
+// from the data object, sorted. Useful for validating a rule against a schema
+// or building dependency indexes before running it.
+func (p *Program) Vars() []string {
+	set := map[string]struct{}{}
+	walk(p.ast, func(e Expr) {
+		if v, ok := e.(*VariableExpr); ok {
+			set[v.Name] = struct{}{}
+		}
+	})
+	return sortedKeys(set)
+}
+
+// Funcs returns the distinct function names the program calls, sorted.
+func (p *Program) Funcs() []string {
+	set := map[string]struct{}{}
+	walk(p.ast, func(e Expr) {
+		if c, ok := e.(*CallExpr); ok {
+			set[c.Name] = struct{}{}
+		}
+	})
+	return sortedKeys(set)
+}
+
+func sortedKeys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// walk visits e and all of its sub-expressions, calling fn on each.
+func walk(e Expr, fn func(Expr)) {
+	fn(e)
+	switch n := e.(type) {
+	case *UnaryExpr:
+		walk(n.Right, fn)
+	case *InfixExpr:
+		walk(n.Left, fn)
+		walk(n.Right, fn)
+	case *TernaryExpr:
+		walk(n.Cond, fn)
+		walk(n.Then, fn)
+		walk(n.Else, fn)
+	case *MemberAccessExpr:
+		walk(n.Left, fn)
+	case *IndexExpr:
+		walk(n.Left, fn)
+		walk(n.Index, fn)
+	case *MethodCallExpr:
+		walk(n.Left, fn)
+		for _, a := range n.Args {
+			walk(a, fn)
+		}
+	case *CallExpr:
+		for _, a := range n.Args {
+			walk(a, fn)
+		}
+	case *ListExpr:
+		for _, el := range n.Elems {
+			walk(el, fn)
+		}
+	}
+}
+
+// foldConstants replaces sub-expressions built entirely from literals with the
+// literal they evaluate to, so a compiled Program does not recompute constant
+// arithmetic on every Eval. Folding is skipped for any subtree whose evaluation
+// errors (e.g. `1/0`), preserving the original error-at-eval semantics.
+func foldConstants(e Expr) Expr {
+	switch n := e.(type) {
+	case *UnaryExpr:
+		n.Right = foldConstants(n.Right)
+		if isLiteral(n.Right) {
+			return tryFold(n)
+		}
+	case *InfixExpr:
+		n.Left = foldConstants(n.Left)
+		n.Right = foldConstants(n.Right)
+		if isLiteral(n.Left) && isLiteral(n.Right) {
+			return tryFold(n)
+		}
+	case *TernaryExpr:
+		n.Cond = foldConstants(n.Cond)
+		n.Then = foldConstants(n.Then)
+		n.Else = foldConstants(n.Else)
+		if lit, ok := n.Cond.(*LiteralExpr); ok {
+			if toBool(lit.Value) {
+				return n.Then
+			}
+			return n.Else
+		}
+	case *ListExpr:
+		allLit := true
+		for i := range n.Elems {
+			n.Elems[i] = foldConstants(n.Elems[i])
+			if !isLiteral(n.Elems[i]) {
+				allLit = false
+			}
+		}
+		if allLit {
+			return tryFold(n)
+		}
+	}
+	return e
+}
+
+// tryFold evaluates a fully-constant node with an empty context; on any error
+// (or panic) it returns the node unchanged so the error surfaces at Eval time.
+func tryFold(e Expr) (out Expr) {
+	defer func() {
+		if recover() != nil {
+			out = e
+		}
+	}()
+	v, err := e.Eval(Context{})
+	if err != nil {
+		return e
+	}
+	return &LiteralExpr{v}
+}
+
+func isLiteral(e Expr) bool {
+	_, ok := e.(*LiteralExpr)
+	return ok
 }
 
 func (e *Engine) Eval(exprStr string, data any) (res any, err error) {

@@ -45,6 +45,237 @@ func TestInOperatorAndListLiterals(t *testing.T) {
 	}
 }
 
+func TestNotInOperator(t *testing.T) {
+	e := NewEngine()
+	cases := []struct {
+		expr string
+		want any
+	}{
+		{"4 not in [1, 2, 3]", true},
+		{"2 not in [1, 2, 3]", false},
+		{"'z' not in 'abc'", true},
+		{"'b' not in 'abc'", false},
+	}
+	for _, c := range cases {
+		got, err := e.Eval(c.expr, nil)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v, err %v, want %v", c.expr, got, err, c.want)
+		}
+	}
+	// `not` without `in` is a clean parse error, not a panic.
+	if _, err := e.Eval("1 not 2", nil); err == nil {
+		t.Fatal("expected error for bare 'not'")
+	}
+}
+
+func TestStringOrdering(t *testing.T) {
+	e := NewEngine()
+	cases := []struct {
+		expr string
+		want any
+	}{
+		{"'a' < 'b'", true},
+		{"'b' > 'a'", true},
+		{"'abc' <= 'abd'", true},
+		{"'abc' >= 'abd'", false},
+		{"'5' > 3", true}, // numeric string vs number still compares numerically
+	}
+	for _, c := range cases {
+		got, err := e.Eval(c.expr, nil)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v, err %v, want %v", c.expr, got, err, c.want)
+		}
+	}
+}
+
+func TestEqualityIsTypeAware(t *testing.T) {
+	e := NewEngine()
+	cases := []struct {
+		expr string
+		want any
+	}{
+		{"1 == '1'", false}, // string is not numerically equal to a number
+		{"'1' != 1", true},
+		{"10 == 10.0", true}, // cross-numeric equality still holds
+		{"'a' == 'a'", true},
+	}
+	for _, c := range cases {
+		got, err := e.Eval(c.expr, nil)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v, err %v, want %v", c.expr, got, err, c.want)
+		}
+	}
+}
+
+func TestInPrecedence(t *testing.T) {
+	e := NewEngine()
+	// `+` (40) binds tighter than `in` (35): (1+1) in [2,3]
+	if got, err := e.Eval("1 + 1 in [2, 3]", nil); err != nil || got != true {
+		t.Fatalf("arith before in: got %v, %v", got, err)
+	}
+	// `in` (35) binds tighter than `==` (30): (2 in [1,2]) == true
+	if got, err := e.Eval("2 in [1, 2] == true", nil); err != nil || got != true {
+		t.Fatalf("in before ==: got %v, %v", got, err)
+	}
+}
+
+// --- strict mode ---------------------------------------------------------------
+
+type strictUser struct {
+	Name string
+	Tags []string
+}
+
+func TestStrictMode(t *testing.T) {
+	e := NewEngine()
+	data := map[string]any{
+		"user":   strictUser{Name: "Alice", Tags: []string{"a"}},
+		"scores": map[string]int{"x": 1},
+	}
+
+	// Non-strict (default): unknown field/key/index resolve to nil.
+	for _, expr := range []string{"user.Naem", "scores.missing", "user.Tags[9]"} {
+		if v, err := e.Eval(expr, data); err != nil || v != nil {
+			t.Fatalf("non-strict %s: got %v, %v", expr, v, err)
+		}
+	}
+
+	e.SetStrict(true)
+	strictErrs := []string{
+		"user.Naem",       // misspelled field
+		"scores.missing",  // absent map key
+		"user.Tags[9]",    // out of range
+		"user.Tags[9] > 0", // propagates through operators
+	}
+	for _, expr := range strictErrs {
+		if _, err := e.Eval(expr, data); !errors.Is(err, ErrUnknownField) {
+			t.Fatalf("strict %s: expected ErrUnknownField, got %v", expr, err)
+		}
+	}
+	// Valid access still works in strict mode.
+	if v, err := e.Eval("user.Name", data); err != nil || v != "Alice" {
+		t.Fatalf("strict valid: got %v, %v", v, err)
+	}
+}
+
+// --- method filter ---------------------------------------------------------------
+
+type guarded struct{ n int }
+
+func (g guarded) Double() int { return g.n * 2 }
+func (g guarded) Danger() int { return 999 }
+
+func TestMethodFilter(t *testing.T) {
+	e := NewEngine()
+	data := map[string]any{"g": guarded{n: 21}}
+
+	// No filter: both methods callable.
+	if v, err := e.Eval("g.Double()", data); err != nil || v != 42 {
+		t.Fatalf("unfiltered Double: %v, %v", v, err)
+	}
+
+	// Allow only Double.
+	e.SetMethodFilter(func(name string) bool { return name == "Double" })
+	if v, err := e.Eval("g.Double()", data); err != nil || v != 42 {
+		t.Fatalf("filtered Double: %v, %v", v, err)
+	}
+	if _, err := e.Eval("g.Danger()", data); !errors.Is(err, ErrMethodDenied) {
+		t.Fatalf("Danger should be denied, got %v", err)
+	}
+
+	// Filter also gates getter-style access (0-in, 1-out method as a field).
+	e.SetMethodFilter(func(name string) bool { return false })
+	if _, err := e.Eval("g.Double", data); !errors.Is(err, ErrMethodDenied) {
+		t.Fatalf("getter should be denied, got %v", err)
+	}
+
+	// nil restores allow-all.
+	e.SetMethodFilter(nil)
+	if v, err := e.Eval("g.Danger()", data); err != nil || v != 999 {
+		t.Fatalf("after reset: %v, %v", v, err)
+	}
+}
+
+// --- constant folding ------------------------------------------------------------
+
+func TestConstantFolding(t *testing.T) {
+	e := NewEngine()
+	// Constant subtree folds to a literal.
+	prog, err := e.Compile("1 + 2 * 3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := prog.ast.(*LiteralExpr); !ok {
+		t.Fatalf("expected folded literal, got %T", prog.ast)
+	}
+	if v, _ := prog.Eval(nil); v != int64(7) {
+		t.Fatalf("folded value: got %v", v)
+	}
+
+	// A constant error subtree is NOT folded (error still surfaces at Eval).
+	prog2, err := e.Compile("1 / 0")
+	if err != nil {
+		t.Fatalf("compile should not error: %v", err)
+	}
+	if _, ok := prog2.ast.(*LiteralExpr); ok {
+		t.Fatal("1/0 must not be folded")
+	}
+	if _, err := prog2.Eval(nil); !errors.Is(err, ErrDivByZero) {
+		t.Fatalf("expected ErrDivByZero at eval, got %v", err)
+	}
+
+	// Mixed constant/variable: only the constant part folds, result stays correct.
+	if v, err := e.Eval("x + 2 * 3", map[string]any{"x": int64(1)}); err != nil || v != int64(7) {
+		t.Fatalf("mixed fold: got %v, %v", v, err)
+	}
+}
+
+// --- introspection ---------------------------------------------------------------
+
+func TestProgramIntrospection(t *testing.T) {
+	e := NewEngine()
+	prog, err := e.Compile("user.Age > 18 && contains(user.Name, 'a') || score in [1, 2]")
+	if err != nil {
+		t.Fatal(err)
+	}
+	vars := prog.Vars()
+	wantVars := map[string]bool{"user": true, "score": true}
+	for _, v := range vars {
+		if !wantVars[v] {
+			t.Fatalf("unexpected var %q in %v", v, vars)
+		}
+	}
+	if len(vars) != 2 {
+		t.Fatalf("expected 2 vars, got %v", vars)
+	}
+	funcs := prog.Funcs()
+	if len(funcs) != 1 || funcs[0] != "contains" {
+		t.Fatalf("expected [contains], got %v", funcs)
+	}
+}
+
+func BenchmarkEvalReparsed(b *testing.B) {
+	e := NewEngine()
+	data := map[string]any{"a": int64(3), "b": int64(4)}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = e.Eval("a * b + a - b", data) // re-parses every call
+	}
+}
+
+func BenchmarkEvalCompiled(b *testing.B) {
+	e := NewEngine()
+	data := map[string]any{"a": int64(3), "b": int64(4)}
+	prog, err := e.Compile("a * b + a - b")
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = prog.Eval(data) // parsed once
+	}
+}
+
 // --- string builtins ----------------------------------------------------------
 
 func TestStringBuiltins(t *testing.T) {

@@ -135,13 +135,14 @@ v, err := e.Eval("add(1, 2)", nil)
 
 List literals use square brackets and can hold any expressions: `[1, 2, 3]`, `['a', 'b']`, `[]`. They evaluate to `[]any`.
 
-The `in` operator tests membership and never panics:
+The `in` operator (and its negation `not in`) tests membership and never panics. It binds at the comparison precedence tier, so `1 + 1 in [2, 3]` parses as `(1 + 1) in [2, 3]`.
 
 | Left / Right | Meaning | Example | Example result |
 |---|---|---|---|
-| `x in slice`/`array` | any element equals `x` (same loose equality as `==`) | `2 in [1, 2, 3]` | `true` |
+| `x in slice`/`array` | any element equals `x` (same equality as `==`) | `2 in [1, 2, 3]` | `true` |
 | `key in map` | the map contains that key | `'a' in scores` | `true` |
 | `sub in string` | substring test | `'ell' in 'hello'` | `true` |
+| `x not in y` | negation of the above | `4 not in [1, 2, 3]` | `true` |
 | other | error | `1 in 2` | error |
 
 ```okra
@@ -172,14 +173,16 @@ If either operand cannot be coerced to a number (and it is not string concatenat
 
 | Operator | Supported types | Rule | Example | Example result |
 |---|---|---|---|---|
-| `> < >= <=` | both sides must be `toFloat`-convertible | otherwise returns error | `10.5 > 10` | `true` |
+| `> < >= <=` | two strings, or both `toFloat`-convertible | two strings compare lexically; otherwise numeric; else error | `'a' < 'b'`, `10.5 > 10` | `true`, `true` |
 
 ### Equality: `== !=`
 
 | Operator | Supported types | Rule | Example | Example result |
 |---|---|---|---|---|
-| `==` | any | `DeepEqual` first; else numeric compare if both `toFloat`; else `false` | `10 == 10.0`, `'a' == 'b'` | `true`, `false` |
-| `!=` | any | `DeepEqual` first; else numeric compare if both `toFloat`; else `true` | `10 != 10.0`, `'a' != 'b'` | `false`, `true` |
+| `==` | any | `DeepEqual` first; else numeric compare when **both sides are numbers**; else `false` | `10 == 10.0`, `1 == '1'` | `true`, `false` |
+| `!=` | any | negation of `==` | `10 != 10.0`, `'1' != 1` | `false`, `true` |
+
+A string is never considered numerically equal to a number (`1 == '1'` is `false`), though two numbers of different kinds still compare by value (`10 == 10.0` is `true`).
 
 ### Logical: `&& ||` (short-circuit)
 
@@ -225,7 +228,18 @@ for _, order := range orders {
 }
 ```
 
-A `Program` always reads the Engine's latest registered functions, so `RegisterFunc` still takes effect after `Compile`.
+A `Program` always reads the Engine's latest registered functions, so `RegisterFunc` still takes effect after `Compile`. At compile time, sub-expressions built entirely from literals are **constant-folded** (e.g. `1 + 2 * 3` becomes the literal `7`), so they are not recomputed on every `Eval`. A subtree that errors when folded (like `1 / 0`) is left intact so the error still surfaces at eval time.
+
+### Inspecting a Program
+
+- `prog.Vars() []string` — the distinct root variable/field identifiers the program reads. Useful for validating a rule against a schema, or building dependency indexes, before running it.
+- `prog.Funcs() []string` — the distinct function names the program calls.
+
+```go
+prog, _ := e.Compile("user.Age > 18 && contains(user.Name, 'a')")
+prog.Vars()  // ["user"]
+prog.Funcs() // ["contains"]
+```
 
 ### Typed Results (`EvalTo`)
 
@@ -245,6 +259,26 @@ Several errors are exported so callers can match them with `errors.Is`, even tho
 - `ErrDivByZero`, `ErrModByZero`, `ErrFloatModulo`
 - `ErrNegativeShift`
 - `ErrNotFound` (unknown function or method)
+- `ErrUnknownField` (strict-mode missing field/key/index)
+- `ErrMethodDenied` (blocked by the method filter)
+
+### Strict Mode
+
+By default a missing field, absent map key, out-of-range index, or member access on `nil` resolves to `nil` (so a misspelled field is silent). Enable strict mode to turn these into errors instead:
+
+```go
+e.SetStrict(true)
+_, err := e.Eval("user.Naem", data) // errors.Is(err, ErrUnknownField)
+```
+
+### Restricting Methods
+
+Because member/method access uses reflection, an expression can call any exported method on the data object. To lock this down, install a filter — names for which it returns `false` are denied (`ErrMethodDenied`). This gates explicit calls (`user.Save()`) and getter-style access alike. `nil` (the default) allows all.
+
+```go
+allowed := map[string]bool{"FullName": true, "Age": true}
+e.SetMethodFilter(func(name string) bool { return allowed[name] })
+```
 
 ### Nesting Depth
 
