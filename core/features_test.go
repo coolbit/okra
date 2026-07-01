@@ -254,6 +254,59 @@ func TestProgramIntrospection(t *testing.T) {
 	}
 }
 
+// --- embedded / promoted struct fields ------------------------------------------
+
+type EmbBase struct {
+	ID   int
+	Name string
+}
+type EmbMeta struct {
+	Kind string `okra:"kind"`
+}
+type EmbUser struct {
+	EmbBase
+	*EmbMeta
+	Name string // shadows EmbBase.Name
+	Age  int
+}
+
+func TestEmbeddedFields(t *testing.T) {
+	e := NewEngine()
+	u := EmbUser{
+		EmbBase: EmbBase{ID: 7, Name: "base"},
+		EmbMeta: &EmbMeta{Kind: "admin"},
+		Name:    "outer",
+		Age:     30,
+	}
+	data := map[string]any{"u": u}
+	cases := []struct {
+		expr string
+		want any
+	}{
+		{"u.ID", 7},                // promoted from EmbBase
+		{"u.Age", 30},              // direct
+		{"u.Name", "outer"},        // outer shadows EmbBase.Name
+		{"u.kind", "admin"},        // promoted from *EmbMeta, via tag
+		{"u.EmbBase.Name", "base"}, // reach the shadowed one explicitly
+	}
+	for _, c := range cases {
+		got, err := e.Eval(c.expr, data)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v (%T), err %v, want %v", c.expr, got, got, err, c.want)
+		}
+	}
+
+	// A promoted field through a nil embedded pointer must not panic.
+	u2 := EmbUser{EmbMeta: nil, Name: "x"}
+	if got, err := e.Eval("u.kind", map[string]any{"u": u2}); err != nil || got != nil {
+		t.Fatalf("nil embedded ptr (non-strict): got %v, err %v", got, err)
+	}
+	e.SetStrict(true)
+	if _, err := e.Eval("u.kind", map[string]any{"u": u2}); !errors.Is(err, ErrUnknownField) {
+		t.Fatalf("nil embedded ptr (strict): expected ErrUnknownField, got %v", err)
+	}
+}
+
 func BenchmarkEvalReparsed(b *testing.B) {
 	e := NewEngine()
 	data := map[string]any{"a": int64(3), "b": int64(4)}

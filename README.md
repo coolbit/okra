@@ -79,12 +79,14 @@ Identifiers may contain Unicode letters, so non-ASCII field and map-key names wo
 
 | Input type | Access | Notes | Example |
 |---|---|---|---|
-| `struct` / `*struct` | `user.Field` | Field access, including `okra` / `json` tag names | `user.Name`, `user.name_tag` |
+| `struct` / `*struct` | `user.Field` | Field access, including `okra` / `json` tag names; fields promoted from **exported embedded** structs are reachable too | `user.Name`, `user.name_tag`, `user.EmbeddedID` |
 | `struct` / `*struct` | `user.Method(args...)` | Method call via reflection | `user.SayHi('hi')` |
 | `struct` / `*struct` | `user.Method` | Getter-style: only if method has **0 inputs** and **>=1 outputs** | `user.MultiReturn` |
 | `map[K]V` | `m.key` or `m[key]` | `key` is a string; if `K` is numeric, Okra tries to parse numeric keys from strings | `scores.1`, `scores[1]` |
 | `[]T` / `[N]T` | `arr.0` or `arr[0]` | Index access; invalid/out-of-range returns `nil` | `nums.1`, `nums[1]` |
 | pointers | auto-dereference | Nil pointers usually yield `nil` (except some special cases like `len`) | `ptr.Field`, `ptr.Method()` |
+
+Field promotion follows Go's rules: a directly-declared field shadows a promoted one of the same name (reach the shadowed field explicitly, e.g. `user.Base.Name`). Only **exported** embedded structs are traversed — reflecting through an unexported field would panic — and a promoted field reached through a `nil` embedded pointer resolves to `nil` (or errors in strict mode).
 
 ### About `arr[0]`
 
@@ -232,7 +234,7 @@ A `Program` always reads the Engine's latest registered functions, so `RegisterF
 
 ### Inspecting a Program
 
-- `prog.Vars() []string` — the distinct root variable/field identifiers the program reads. Useful for validating a rule against a schema, or building dependency indexes, before running it.
+- `prog.Vars() []string` — the distinct **root** variable identifiers the program reads (the base of each access chain, so `user.Age` reports `user`, not the full path `user.Age`). Useful for validating which top-level objects a rule needs, or building dependency indexes, before running it.
 - `prog.Funcs() []string` — the distinct function names the program calls.
 
 ```go
@@ -273,7 +275,7 @@ _, err := e.Eval("user.Naem", data) // errors.Is(err, ErrUnknownField)
 
 ### Restricting Methods
 
-Because member/method access uses reflection, an expression can call any exported method on the data object. To lock this down, install a filter — names for which it returns `false` are denied (`ErrMethodDenied`). This gates explicit calls (`user.Save()`) and getter-style access alike. `nil` (the default) allows all.
+Because member/method access uses reflection, an expression can call any exported method on the data object. To lock this down, install a filter — names for which it returns `false` are denied (`ErrMethodDenied`). This gates **reflected** calls into the data object: explicit method calls (`user.Save()`) and getter-style access alike. It does **not** gate built-in or `RegisterFunc` functions, nor the `x.len()` shortcut — control those by not registering them. `nil` (the default) allows all.
 
 ```go
 allowed := map[string]bool{"FullName": true, "Age": true}

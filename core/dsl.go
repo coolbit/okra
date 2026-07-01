@@ -107,39 +107,77 @@ type Expr interface {
 // -----------------------------------------------------------------------------
 
 type structMeta struct {
-	fields  map[string]int
+	// fields maps a name (field name or okra/json tag) to the index path used
+	// by reflect.Value.FieldByIndexErr. A path has more than one element when
+	// the field is promoted from an embedded struct.
+	fields  map[string][]int
 	methods map[string]struct{}
 }
 
 var metaCache sync.Map
+
+// registerField records f under its name and tag, without overwriting an entry
+// already present (so a shallower field shadows a deeper promoted one, as in Go).
+func registerField(meta *structMeta, f reflect.StructField, path []int) {
+	if _, exists := meta.fields[f.Name]; !exists {
+		meta.fields[f.Name] = path
+	}
+	tag := f.Tag.Get("okra")
+	if tag == "" {
+		tag = f.Tag.Get("json")
+	}
+	if tag != "" && tag != "-" {
+		if idx := strings.Index(tag, ","); idx != -1 {
+			tag = tag[:idx]
+		}
+		if _, exists := meta.fields[tag]; !exists {
+			meta.fields[tag] = path
+		}
+	}
+}
 
 func getStructMeta(t reflect.Type) structMeta {
 	if val, ok := metaCache.Load(t); ok {
 		return val.(structMeta)
 	}
 	meta := structMeta{
-		fields:  make(map[string]int),
+		fields:  make(map[string][]int),
 		methods: make(map[string]struct{}),
 	}
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		// Unexported fields cannot be read via reflect.Value.Interface()
-		// (it panics), so never expose them to expressions.
-		if f.PkgPath != "" {
-			continue
-		}
-		meta.fields[f.Name] = i
-		tag := f.Tag.Get("okra")
-		if tag == "" {
-			tag = f.Tag.Get("json")
-		}
-		if tag != "" && tag != "-" {
-			if idx := strings.Index(tag, ","); idx != -1 {
-				tag = tag[:idx]
+	// Breadth-first over embedded structs so shallower fields win. Only exported
+	// fields (and only exported embedded structs) are traversed: reading through
+	// an unexported field via reflect would panic on .Interface().
+	type frame struct {
+		t    reflect.Type
+		path []int
+	}
+	queue := []frame{{t, nil}}
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		for i := 0; i < cur.t.NumField(); i++ {
+			f := cur.t.Field(i)
+			path := append(append([]int{}, cur.path...), i)
+			if f.PkgPath != "" { // unexported
+				continue
 			}
-			meta.fields[tag] = i
+			if f.Anonymous {
+				// The embedded field is itself accessible (e.g. user.Base)...
+				registerField(&meta, f, path)
+				// ...and its own exported fields are promoted.
+				ft := f.Type
+				for ft.Kind() == reflect.Pointer {
+					ft = ft.Elem()
+				}
+				if ft.Kind() == reflect.Struct {
+					queue = append(queue, frame{ft, path})
+				}
+				continue
+			}
+			registerField(&meta, f, path)
 		}
 	}
+	// reflect's method set already includes methods promoted from embedded types.
 	for i := 0; i < t.NumMethod(); i++ {
 		meta.methods[t.Method(i).Name] = struct{}{}
 	}
@@ -639,8 +677,13 @@ func getMember(ctx Context, obj any, key string) (any, error) {
 		return rv.Index(idx).Interface(), nil
 	case reflect.Struct:
 		meta := getStructMeta(rv.Type())
-		if idx, ok := meta.fields[key]; ok {
-			return rv.Field(idx).Interface(), nil
+		if path, ok := meta.fields[key]; ok {
+			fv, err := rv.FieldByIndexErr(path)
+			if err != nil {
+				// Promoted field reached through a nil embedded pointer.
+				return ctx.miss("cannot access %q through nil embedded pointer", key)
+			}
+			return fv.Interface(), nil
 		}
 		if _, ok := meta.methods[key]; ok {
 			if !ctx.methodAllowed(key) {
