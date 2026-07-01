@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"strconv"
 	"strings"
@@ -94,7 +95,7 @@ func getStructMeta(t reflect.Type) structMeta {
 	for i := 0; i < t.NumMethod(); i++ {
 		meta.methods[t.Method(i).Name] = struct{}{}
 	}
-	pt := reflect.PtrTo(t)
+	pt := reflect.PointerTo(t)
 	for i := 0; i < pt.NumMethod(); i++ {
 		meta.methods[pt.Method(i).Name] = struct{}{}
 	}
@@ -159,7 +160,7 @@ func (e *IndexExpr) Eval(ctx Context) (any, error) {
 	}
 
 	rv := reflect.ValueOf(obj)
-	for rv.Kind() == reflect.Ptr {
+	for rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
 			return nil, nil
 		}
@@ -235,7 +236,7 @@ func (e *MethodCallExpr) Eval(ctx Context) (any, error) {
 
 	if e.Method == "len" && len(e.Args) == 0 {
 		rv := reflect.ValueOf(obj)
-		for rv.Kind() == reflect.Ptr {
+		for rv.Kind() == reflect.Pointer {
 			if rv.IsNil() {
 				return int64(0), nil
 			}
@@ -459,7 +460,7 @@ func getMember(obj any, key string) (any, error) {
 		return nil, nil
 	}
 	rv := reflect.ValueOf(obj)
-	for rv.Kind() == reflect.Ptr {
+	for rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
 			return nil, nil
 		}
@@ -508,7 +509,7 @@ func callReflectMethod(obj any, name string, args []any) (any, error) {
 	rv := reflect.ValueOf(obj)
 	mv := rv.MethodByName(name)
 	if !mv.IsValid() {
-		if rv.Kind() != reflect.Ptr {
+		if rv.Kind() != reflect.Pointer {
 			// If obj is a non-pointer value held in an interface, it is not addressable.
 			// Create an addressable copy so we can still call pointer-receiver methods.
 			addr := reflect.New(rv.Type())
@@ -569,7 +570,7 @@ func callReflectMethod(obj any, name string, args []any) (any, error) {
 	if len(out) == 0 {
 		return nil, nil
 	}
-	if len(out) > 1 && out[len(out)-1].Type().Implements(reflect.TypeOf((*error)(nil)).Elem()) {
+	if len(out) > 1 && out[len(out)-1].Type().Implements(reflect.TypeFor[error]()) {
 		if !out[len(out)-1].IsNil() {
 			return nil, out[len(out)-1].Interface().(error)
 		}
@@ -996,10 +997,10 @@ func (e *Engine) RegisterFunc(name string, fn CustomFunc) error {
 	}
 	curr := e.loadFuncs()
 	next := make(map[string]CustomFunc, len(curr)+1)
-	for k, v := range curr {
-		next[k] = v
-	}
-	next[name] = fn
+	maps.Copy(next, curr)
+	// Lookup in CallExpr.Eval normalizes names to lower case, so store the
+	// key the same way to keep registration case-insensitive.
+	next[strings.ToLower(name)] = fn
 	e.funcs.Store(next)
 	return nil
 }
