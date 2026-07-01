@@ -11,9 +11,24 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
+// MaxStackDepth is the default parser nesting limit. It can be overridden per
+// Engine via SetMaxNestingDepth. The limit bounds parser recursion (and hence
+// AST depth and evaluation recursion), keeping deeply nested input from
+// exhausting the Go stack.
 const MaxStackDepth = 256
+
+// Sentinel errors returned by evaluation. Callers can test for them with
+// errors.Is even though they are wrapped with additional context.
+var (
+	ErrDivByZero     = errors.New("division by zero")
+	ErrModByZero     = errors.New("modulo by zero")
+	ErrFloatModulo   = errors.New("float modulo not supported")
+	ErrNegativeShift = errors.New("negative shift count")
+	ErrNotFound      = errors.New("function or method not found")
+)
 
 // -----------------------------------------------------------------------------
 // Core Types & Context
@@ -41,12 +56,12 @@ func evalBitwise(lv, rv any, op string) (any, error) {
 		return li ^ ri, nil
 	case "<<":
 		if ri < 0 {
-			return nil, errors.New("negative shift count")
+			return nil, ErrNegativeShift
 		}
 		return li << uint64(ri), nil
 	case ">>":
 		if ri < 0 {
-			return nil, errors.New("negative shift count")
+			return nil, ErrNegativeShift
 		}
 		return li >> uint64(ri), nil
 	default:
@@ -80,6 +95,11 @@ func getStructMeta(t reflect.Type) structMeta {
 	}
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
+		// Unexported fields cannot be read via reflect.Value.Interface()
+		// (it panics), so never expose them to expressions.
+		if f.PkgPath != "" {
+			continue
+		}
 		meta.fields[f.Name] = i
 		tag := f.Tag.Get("okra")
 		if tag == "" {
@@ -112,9 +132,36 @@ type LiteralExpr struct{ Value any }
 func (e *LiteralExpr) Eval(ctx Context) (any, error) { return e.Value, nil }
 func (e *LiteralExpr) String() string {
 	if s, ok := e.Value.(string); ok {
-		return strconv.Quote(s)
+		// Emit okra's single-quoted string syntax so String() round-trips
+		// back through ParseExpr. strconv.Quote gives a double-quoted Go
+		// literal; swap the delimiters and fix the escaped quotes.
+		q := strconv.Quote(s)
+		q = strings.ReplaceAll(q[1:len(q)-1], `\"`, `"`)
+		q = strings.ReplaceAll(q, `'`, `\'`)
+		return "'" + q + "'"
 	}
 	return fmt.Sprint(e.Value)
+}
+
+type ListExpr struct{ Elems []Expr }
+
+func (e *ListExpr) Eval(ctx Context) (any, error) {
+	out := make([]any, len(e.Elems))
+	for i, el := range e.Elems {
+		v, err := el.Eval(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = v
+	}
+	return out, nil
+}
+func (e *ListExpr) String() string {
+	parts := make([]string, len(e.Elems))
+	for i, el := range e.Elems {
+		parts[i] = el.String()
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 
 type VariableExpr struct{ Name string }
@@ -125,9 +172,8 @@ func (e *VariableExpr) Eval(ctx Context) (any, error) {
 func (e *VariableExpr) String() string { return e.Name }
 
 type MemberAccessExpr struct {
-	Left    Expr
-	Key     string
-	IsIndex bool
+	Left Expr
+	Key  string
 }
 
 func (e *MemberAccessExpr) Eval(ctx Context) (any, error) {
@@ -138,9 +184,6 @@ func (e *MemberAccessExpr) Eval(ctx Context) (any, error) {
 	return getMember(val, e.Key)
 }
 func (e *MemberAccessExpr) String() string {
-	if e.IsIndex {
-		return fmt.Sprintf("%s[%s]", e.Left.String(), e.Key)
-	}
 	return fmt.Sprintf("%s.%s", e.Left.String(), e.Key)
 }
 
@@ -286,8 +329,10 @@ func (e *CallExpr) Eval(ctx Context) (any, error) {
 		return fn(args)
 	}
 
-	// 2. FALLBACK: Try to find the method on the root Data object
-	if ctx.Data != nil {
+	// 2. FALLBACK: Try to find the method on the root Data object. Only fall
+	// through to "not found" when the method genuinely does not exist; if it
+	// exists but fails, surface that real error instead of masking it.
+	if ctx.Data != nil && hasMethod(ctx.Data, e.Name) {
 		args := make([]any, len(e.Args))
 		for i, argExpr := range e.Args {
 			v, err := argExpr.Eval(ctx)
@@ -296,14 +341,10 @@ func (e *CallExpr) Eval(ctx Context) (any, error) {
 			}
 			args[i] = v
 		}
-		// Attempt to call it as a method on the root object
-		res, err := callReflectMethod(ctx.Data, e.Name, args)
-		if err == nil {
-			return res, nil
-		}
+		return callReflectMethod(ctx.Data, e.Name, args)
 	}
 
-	return nil, fmt.Errorf("function or method %s not found", e.Name)
+	return nil, fmt.Errorf("%q: %w", e.Name, ErrNotFound)
 }
 
 func (e *CallExpr) String() string {
@@ -387,25 +428,9 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 	}
 	switch e.Op {
 	case "==":
-		if reflect.DeepEqual(lv, rv) {
-			return true, nil
-		}
-		lf, okL := toFloat(lv)
-		rf, okR := toFloat(rv)
-		if okL && okR {
-			return lf == rf, nil
-		}
-		return false, nil
+		return valuesEqual(lv, rv), nil
 	case "!=":
-		if reflect.DeepEqual(lv, rv) {
-			return false, nil
-		}
-		lf, okL := toFloat(lv)
-		rf, okR := toFloat(rv)
-		if okL && okR {
-			return lf != rf, nil
-		}
-		return true, nil
+		return !valuesEqual(lv, rv), nil
 	case "+":
 		if ls, ok := lv.(string); ok {
 			return ls + fmt.Sprint(rv), nil
@@ -423,8 +448,63 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 		return compare(lv, rv, e.Op)
 	case "&", "|", "^", "<<", ">>":
 		return evalBitwise(lv, rv, e.Op)
+	case "in":
+		return evalIn(lv, rv)
 	}
 	return nil, nil
+}
+
+// valuesEqual implements the loose equality used by == / != / in: exact
+// DeepEqual first, then a numeric comparison if both sides are numbers.
+func valuesEqual(lv, rv any) bool {
+	if reflect.DeepEqual(lv, rv) {
+		return true
+	}
+	lf, okL := toFloat(lv)
+	rf, okR := toFloat(rv)
+	if okL && okR {
+		return lf == rf
+	}
+	return false
+}
+
+// evalIn implements `needle in haystack`: membership over slice/array
+// elements or map keys, and substring for strings. It never panics.
+func evalIn(needle, haystack any) (any, error) {
+	if haystack == nil {
+		return false, nil
+	}
+	if hs, ok := haystack.(string); ok {
+		sub, ok := needle.(string)
+		if !ok {
+			return nil, fmt.Errorf("invalid 'in': need string on left, got %T", needle)
+		}
+		return strings.Contains(hs, sub), nil
+	}
+	rv := reflect.ValueOf(haystack)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return false, nil
+		}
+		rv = rv.Elem()
+	}
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < rv.Len(); i++ {
+			if valuesEqual(needle, rv.Index(i).Interface()) {
+				return true, nil
+			}
+		}
+		return false, nil
+	case reflect.Map:
+		for _, k := range rv.MapKeys() {
+			if valuesEqual(needle, k.Interface()) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	return nil, fmt.Errorf("invalid 'in' on type %T", haystack)
 }
 func (e *InfixExpr) String() string {
 	return fmt.Sprintf("(%s %s %s)", e.Left.String(), e.Op, e.Right.String())
@@ -503,6 +583,22 @@ func getMember(obj any, key string) (any, error) {
 		}
 	}
 	return nil, nil
+}
+
+// hasMethod reports whether obj (or its addressable pointer form) has an
+// exported method called name. Used to distinguish "method absent" from
+// "method present but failed" so real errors are not masked as not-found.
+func hasMethod(obj any, name string) bool {
+	rv := reflect.ValueOf(obj)
+	if rv.MethodByName(name).IsValid() {
+		return true
+	}
+	if rv.Kind() != reflect.Pointer && rv.IsValid() {
+		addr := reflect.New(rv.Type())
+		addr.Elem().Set(rv)
+		return addr.MethodByName(name).IsValid()
+	}
+	return false
 }
 
 func callReflectMethod(obj any, name string, args []any) (any, error) {
@@ -592,12 +688,12 @@ func evalMath(lv, rv any, op rune) (any, error) {
 			return li * ri, nil
 		case '/':
 			if ri == 0 {
-				return nil, errors.New("div by zero")
+				return nil, ErrDivByZero
 			}
 			return li / ri, nil
 		case '%':
 			if ri == 0 {
-				return nil, errors.New("div by zero")
+				return nil, ErrModByZero
 			}
 			return li % ri, nil
 		}
@@ -616,11 +712,11 @@ func evalMath(lv, rv any, op rune) (any, error) {
 		return lf * rf, nil
 	case '/':
 		if rf == 0 {
-			return nil, errors.New("div by zero")
+			return nil, ErrDivByZero
 		}
 		return lf / rf, nil
 	case '%':
-		return nil, errors.New("float modulo not supported")
+		return nil, ErrFloatModulo
 	}
 	return nil, nil
 }
@@ -673,84 +769,149 @@ type lexer struct {
 	pos int
 }
 
-func (l *lexer) nextToken() (token, error) {
-	for l.pos < len(l.s) && unicode.IsSpace(rune(l.s[l.pos])) {
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// lexNumber consumes a numeric run starting at start. It accepts decimal and
+// hex (0x) integers, floats with an optional exponent, and underscores. The
+// run is validated later in nud; invalid runs produce a parse error rather
+// than being silently truncated.
+func (l *lexer) lexNumber(start int) token {
+	if l.s[start] == '0' && start+1 < len(l.s) && (l.s[start+1] == 'x' || l.s[start+1] == 'X') {
+		l.pos = start + 2
+		for l.pos < len(l.s) && (isHexDigit(l.s[l.pos]) || l.s[l.pos] == '_') {
+			l.pos++
+		}
+		return token{tNumber, l.s[start:l.pos], start}
+	}
+	l.pos = start
+	for l.pos < len(l.s) {
+		c := l.s[l.pos]
+		if (c >= '0' && c <= '9') || c == '.' || c == '_' {
+			l.pos++
+			continue
+		}
+		if c == 'e' || c == 'E' {
+			l.pos++
+			if l.pos < len(l.s) && (l.s[l.pos] == '+' || l.s[l.pos] == '-') {
+				l.pos++
+			}
+			continue
+		}
+		break
+	}
+	return token{tNumber, l.s[start:l.pos], start}
+}
+
+// lexString reads a quoted string beginning just after the opening quote q.
+func (l *lexer) lexString(q byte, start int) (token, error) {
+	var sb strings.Builder
+	for l.pos < len(l.s) {
+		curr := l.s[l.pos]
+		if curr == q {
+			l.pos++
+			return token{tString, sb.String(), start}, nil
+		}
+		if curr == '\\' {
+			if l.pos+1 < len(l.s) && l.s[l.pos+1] == q {
+				sb.WriteByte(q)
+				l.pos += 2
+				continue
+			}
+			val, _, tail, err := strconv.UnquoteChar(l.s[l.pos:], q)
+			if err != nil {
+				return token{}, err
+			}
+			consumed := len(l.s[l.pos:]) - len(tail)
+			l.pos += consumed
+			sb.WriteRune(val)
+			continue
+		}
 		l.pos++
+		sb.WriteByte(curr)
+	}
+	return token{}, errors.New("unterminated string")
+}
+
+func (l *lexer) nextToken() (token, error) {
+	// Skip whitespace (rune-aware for multi-byte spaces).
+	for l.pos < len(l.s) {
+		r, size := utf8.DecodeRuneInString(l.s[l.pos:])
+		if !unicode.IsSpace(r) {
+			break
+		}
+		l.pos += size
 	}
 	if l.pos >= len(l.s) {
 		return token{tEOF, "", l.pos}, nil
 	}
 	start := l.pos
-	r := l.s[l.pos]
-	l.pos++
+	r, size := utf8.DecodeRuneInString(l.s[l.pos:])
+
 	switch {
-	case unicode.IsDigit(rune(r)):
-		for l.pos < len(l.s) && (unicode.IsDigit(rune(l.s[l.pos])) || l.s[l.pos] == '.') {
-			l.pos++
-		}
-		return token{tNumber, l.s[start:l.pos], start}, nil
-	case unicode.IsLetter(rune(r)) || r == '_':
-		for l.pos < len(l.s) && (unicode.IsLetter(rune(l.s[l.pos])) || unicode.IsDigit(rune(l.s[l.pos])) || l.s[l.pos] == '_') {
-			l.pos++
+	case r >= '0' && r <= '9':
+		return l.lexNumber(start), nil
+	case unicode.IsLetter(r) || r == '_':
+		l.pos += size
+		for l.pos < len(l.s) {
+			c, csize := utf8.DecodeRuneInString(l.s[l.pos:])
+			if unicode.IsLetter(c) || unicode.IsDigit(c) || c == '_' {
+				l.pos += csize
+				continue
+			}
+			break
 		}
 		return token{tIdent, l.s[start:l.pos], start}, nil
 	case r == '"' || r == '\'':
-		q := r
-		var sb strings.Builder
-		for l.pos < len(l.s) {
-			curr := l.s[l.pos]
-			if curr == q {
-				l.pos++
-				return token{tString, sb.String(), start}, nil
-			}
-			if curr == '\\' {
-				if l.pos+1 < len(l.s) && l.s[l.pos+1] == q {
-					sb.WriteByte(q)
-					l.pos += 2
-					continue
-				}
-				val, _, tail, err := strconv.UnquoteChar(l.s[l.pos:], byte(q))
-				if err != nil {
-					return token{}, err
-				}
-				consumed := len(l.s[l.pos:]) - len(tail)
-				l.pos += consumed
-				sb.WriteRune(val)
-				continue
-			}
-			l.pos++
-			sb.WriteByte(curr)
-		}
-		return token{}, errors.New("unterminated string")
-	case r == '[':
-		return token{tOp, "[", start}, nil
-	case r == ']':
-		return token{tOp, "]", start}, nil
-	case r == '(':
-		return token{tLParen, "(", start}, nil
-	case r == ')':
-		return token{tRParen, ")", start}, nil
-	case r == ',':
-		return token{tComma, ",", start}, nil
-	case r == '.':
-		return token{tOp, ".", start}, nil
-	default:
-		ops := []string{"==", "!=", "<=", ">=", "&&", "||", "<<", ">>"}
-		for _, op := range ops {
-			if strings.HasPrefix(l.s[start:], op) {
-				l.pos = start + len(op)
-				return token{tOp, op, start}, nil
-			}
-		}
-		return token{tOp, string(r), start}, nil
+		l.pos += size // consume the opening quote (ASCII)
+		return l.lexString(byte(r), start)
 	}
+
+	// Punctuation and operators are all ASCII.
+	l.pos += size
+	switch r {
+	case '[':
+		return token{tOp, "[", start}, nil
+	case ']':
+		return token{tOp, "]", start}, nil
+	case '(':
+		return token{tLParen, "(", start}, nil
+	case ')':
+		return token{tRParen, ")", start}, nil
+	case ',':
+		return token{tComma, ",", start}, nil
+	case '.':
+		return token{tOp, ".", start}, nil
+	}
+	ops := []string{"==", "!=", "<=", ">=", "&&", "||", "<<", ">>"}
+	for _, op := range ops {
+		if strings.HasPrefix(l.s[start:], op) {
+			l.pos = start + len(op)
+			return token{tOp, op, start}, nil
+		}
+	}
+	return token{tOp, string(r), start}, nil
 }
 
 type parser struct {
-	lex    *lexer
-	curr   token
-	next   token
-	lexErr error
+	lex      *lexer
+	curr     token
+	next     token
+	lexErr   error
+	maxDepth int
+}
+
+// newParser builds a parser over s with the given nesting limit. A non-positive
+// limit falls back to MaxStackDepth.
+func newParser(s string, maxDepth int) *parser {
+	if maxDepth <= 0 {
+		maxDepth = MaxStackDepth
+	}
+	p := &parser{lex: &lexer{s: s}, maxDepth: maxDepth}
+	p.advance()
+	p.advance()
+	return p
 }
 
 func (p *parser) advance() {
@@ -769,8 +930,8 @@ func (p *parser) advance() {
 }
 
 func (p *parser) parse(rbp int, depth int) (Expr, error) {
-	if depth > MaxStackDepth {
-		return nil, errors.New("stack overflow")
+	if depth > p.maxDepth {
+		return nil, fmt.Errorf("expression nesting too deep (max %d)", p.maxDepth)
 	}
 	if p.lexErr != nil {
 		return nil, p.lexErr
@@ -798,15 +959,35 @@ func (p *parser) parse(rbp int, depth int) (Expr, error) {
 	return left, nil
 }
 
+// parseNumber turns a numeric token into an int64 or float64 literal,
+// returning an error for malformed numbers instead of silently yielding 0.
+func parseNumber(raw string) (Expr, error) {
+	s := strings.ReplaceAll(raw, "_", "")
+	if len(s) >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X') {
+		i, err := strconv.ParseInt(s, 0, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid number %q: %w", raw, err)
+		}
+		return &LiteralExpr{i}, nil
+	}
+	if strings.ContainsAny(s, ".eE") {
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid number %q: %w", raw, err)
+		}
+		return &LiteralExpr{f}, nil
+	}
+	i, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid number %q: %w", raw, err)
+	}
+	return &LiteralExpr{i}, nil
+}
+
 func (p *parser) nud(t token, depth int) (Expr, error) {
 	switch t.typ {
 	case tNumber:
-		if strings.Contains(t.val, ".") {
-			f, _ := strconv.ParseFloat(t.val, 64)
-			return &LiteralExpr{f}, nil
-		}
-		i, _ := strconv.ParseInt(t.val, 10, 64)
-		return &LiteralExpr{i}, nil
+		return parseNumber(t.val)
 	case tString:
 		return &LiteralExpr{t.val}, nil
 	case tIdent:
@@ -843,6 +1024,24 @@ func (p *parser) nud(t token, depth int) (Expr, error) {
 				return nil, err
 			}
 			return &UnaryExpr{Op: t.val, Right: right}, nil
+		case "[":
+			// List literal: [a, b, c] or []
+			var elems []Expr
+			for p.curr.typ != tOp || p.curr.val != "]" {
+				if p.curr.typ == tEOF {
+					return nil, errors.New("missing ] in list literal")
+				}
+				el, err := p.parse(0, depth+1)
+				if err != nil {
+					return nil, err
+				}
+				elems = append(elems, el)
+				if p.curr.typ == tComma {
+					p.advance()
+				}
+			}
+			p.advance() // consume ]
+			return &ListExpr{Elems: elems}, nil
 		default:
 			return nil, fmt.Errorf("unexpected token %s", t.val)
 		}
@@ -949,6 +1148,11 @@ func lbp(t token) int {
 		case "?":
 			return 5
 		}
+	case tIdent:
+		if t.val == "in" {
+			return 33 // membership, just below the ordering comparisons
+		}
+		return 0
 	default:
 		return 0
 	}
@@ -959,7 +1163,10 @@ func lbp(t token) int {
 // Engine & Utils
 // -----------------------------------------------------------------------------
 
-type Engine struct{ funcs atomic.Value }
+type Engine struct {
+	funcs    atomic.Value
+	maxDepth atomic.Int64
+}
 
 func defaultFuncs() map[string]CustomFunc {
 	return map[string]CustomFunc{
@@ -980,7 +1187,40 @@ func defaultFuncs() map[string]CustomFunc {
 			}
 			return int64(0), nil
 		},
-		"now": func(args []any) (any, error) { return time.Now().Unix(), nil },
+		"now":        func(args []any) (any, error) { return time.Now().Unix(), nil },
+		"contains":   strBinFunc("contains", strings.Contains),
+		"startswith": strBinFunc("startsWith", strings.HasPrefix),
+		"endswith":   strBinFunc("endsWith", strings.HasSuffix),
+		"lower":      strUnaryFunc("lower", strings.ToLower),
+		"upper":      strUnaryFunc("upper", strings.ToUpper),
+		"trim":       strUnaryFunc("trim", strings.TrimSpace),
+	}
+}
+
+// asString coerces an argument to a string, accepting Go strings directly and
+// otherwise falling back to fmt.Sprint so numbers/bools are usable too.
+func asString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return fmt.Sprint(v)
+}
+
+func strBinFunc(name string, fn func(string, string) bool) CustomFunc {
+	return func(args []any) (any, error) {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("%s: expected 2 args, got %d", name, len(args))
+		}
+		return fn(asString(args[0]), asString(args[1])), nil
+	}
+}
+
+func strUnaryFunc(name string, fn func(string) string) CustomFunc {
+	return func(args []any) (any, error) {
+		if len(args) != 1 {
+			return nil, fmt.Errorf("%s: expected 1 arg, got %d", name, len(args))
+		}
+		return fn(asString(args[0])), nil
 	}
 }
 
@@ -997,7 +1237,25 @@ func (e *Engine) loadFuncs() (m map[string]CustomFunc) {
 func NewEngine() *Engine {
 	e := &Engine{}
 	e.funcs.Store(defaultFuncs())
+	e.maxDepth.Store(MaxStackDepth)
 	return e
+}
+
+// SetMaxNestingDepth overrides the parser nesting limit for expressions
+// compiled by this Engine. A non-positive value restores the default
+// (MaxStackDepth). Safe to call concurrently.
+func (e *Engine) SetMaxNestingDepth(n int) {
+	if n <= 0 {
+		n = MaxStackDepth
+	}
+	e.maxDepth.Store(int64(n))
+}
+
+func (e *Engine) depthLimit() int {
+	if n := int(e.maxDepth.Load()); n > 0 {
+		return n
+	}
+	return MaxStackDepth
 }
 
 func (e *Engine) RegisterFunc(name string, fn CustomFunc) error {
@@ -1027,8 +1285,9 @@ type Program struct {
 	engine *Engine
 }
 
-// Compile parses exprStr once and returns a reusable Program. Parse-time
-// panics are recovered and returned as errors, mirroring Eval.
+// Compile parses exprStr once and returns a reusable Program, honoring the
+// Engine's nesting limit. Parse-time panics are recovered and returned as
+// errors, mirroring Eval.
 func (e *Engine) Compile(exprStr string) (prog *Program, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1036,7 +1295,7 @@ func (e *Engine) Compile(exprStr string) (prog *Program, err error) {
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
-	ast, err := ParseExpr(exprStr)
+	ast, err := parseWithDepth(exprStr, e.depthLimit())
 	if err != nil {
 		return nil, err
 	}
@@ -1101,15 +1360,24 @@ func toBool(v any) bool {
 		return b
 	}
 	if s, ok := v.(string); ok {
-		return s != "" && s != "false"
+		return s != "" && !strings.EqualFold(s, "false")
 	}
 	f, _ := toFloat(v)
 	return f != 0
 }
 
-// EvalTo evaluates the expression and attempts to cast/convert the result to type T.
-func EvalTo[T any](e *Engine, exprStr string, data any) (T, error) {
+// EvalTo evaluates the expression and attempts to cast/convert the result to
+// type T. Note: converting a float result to an integer T truncates toward
+// zero (e.g. EvalTo[int] of 1.9 yields 1). Any panic from the conversion is
+// recovered and returned as an error.
+func EvalTo[T any](e *Engine, exprStr string, data any) (out T, retErr error) {
 	var zero T
+	defer func() {
+		if r := recover(); r != nil {
+			out = zero
+			retErr = fmt.Errorf("panic: %v", r)
+		}
+	}()
 	raw, err := e.Eval(exprStr, data)
 	if err != nil {
 		return zero, err
@@ -1157,13 +1425,17 @@ func EvalTo[T any](e *Engine, exprStr string, data any) (T, error) {
 	return zero, fmt.Errorf("result type %T is not compatible with target type %T", raw, zero)
 }
 
-func ParseExpr(s string) (Expr, error) {
-	l := &lexer{s: s}
-	p := &parser{lex: l}
-	p.advance() // Initialize curr
-	p.advance() // Initialize next
-
-	ast, err := p.parse(0, 0)
+// parseWithDepth parses s with the given nesting limit. Any panic is recovered
+// and returned as an error so parsing can never crash the caller.
+func parseWithDepth(s string, maxDepth int) (ast Expr, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			ast = nil
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	p := newParser(s, maxDepth)
+	ast, err = p.parse(0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1171,4 +1443,10 @@ func ParseExpr(s string) (Expr, error) {
 		return nil, fmt.Errorf("extra token %s at position %d", p.curr.val, p.curr.pos)
 	}
 	return ast, nil
+}
+
+// ParseExpr parses s into an AST using the default nesting limit. It never
+// panics; malformed input is returned as an error.
+func ParseExpr(s string) (Expr, error) {
+	return parseWithDepth(s, MaxStackDepth)
 }

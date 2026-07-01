@@ -291,7 +291,7 @@ func TestAllNodes_String(t *testing.T) {
 		{
 			name: "Literal String",
 			expr: &LiteralExpr{Value: "okra"},
-			want: `"okra"`,
+			want: `'okra'`,
 		},
 		{
 			name: "Variable",
@@ -301,18 +301,16 @@ func TestAllNodes_String(t *testing.T) {
 		{
 			name: "Member Access (Dot)",
 			expr: &MemberAccessExpr{
-				Left:    &VariableExpr{Name: "user"},
-				Key:     "Age",
-				IsIndex: false,
+				Left: &VariableExpr{Name: "user"},
+				Key:  "Age",
 			},
 			want: "user.Age",
 		},
 		{
-			name: "Member Access (Index)",
-			expr: &MemberAccessExpr{
-				Left:    &VariableExpr{Name: "tags"},
-				Key:     "0",
-				IsIndex: true,
+			name: "Index Expression",
+			expr: &IndexExpr{
+				Left:  &VariableExpr{Name: "tags"},
+				Index: &LiteralExpr{Value: int64(0)},
 			},
 			want: "tags[0]",
 		},
@@ -325,7 +323,7 @@ func TestAllNodes_String(t *testing.T) {
 					&LiteralExpr{Value: "prefix"},
 				},
 			},
-			want: `user.GetName("prefix")`,
+			want: `user.GetName('prefix')`,
 		},
 		{
 			name: "Function Call",
@@ -1205,8 +1203,8 @@ func TestOkra_Errors(t *testing.T) {
 
 	t.Run("Division by Zero", func(t *testing.T) {
 		_, err := engine.Eval("10 / 0", nil)
-		if err == nil || err.Error() != "div by zero" {
-			t.Errorf("Expected div by zero error, got %v", err)
+		if !errors.Is(err, ErrDivByZero) {
+			t.Errorf("Expected ErrDivByZero, got %v", err)
 		}
 	})
 
