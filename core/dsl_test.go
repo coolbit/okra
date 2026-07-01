@@ -519,8 +519,8 @@ func TestCoverage_EdgeCases(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res != 0 {
-			t.Fatalf("want 0, got %v", res)
+		if res != int64(0) {
+			t.Fatalf("want int64(0), got %v (%T)", res, res)
 		}
 	})
 
@@ -1039,19 +1039,15 @@ func TestCoverage_EdgeCases(t *testing.T) {
 		}
 	})
 
-	t.Run("evalMath float modulo fallthrough", func(t *testing.T) {
-		res, err := evalMath(1.2, 2.0, '%')
-		if err != nil {
-			t.Fatal(err)
+	t.Run("evalMath float modulo errors", func(t *testing.T) {
+		if _, err := evalMath(1.2, 2.0, '%'); err == nil {
+			t.Fatal("expected float modulo error")
 		}
-		if res != nil {
-			t.Fatalf("expected nil, got %v", res)
-		}
-		_, err = evalMath(1.2, 0.0, '/')
+		_, err := evalMath(1.2, 0.0, '/')
 		if err == nil {
 			t.Fatal("expected error")
 		}
-		res, err = evalMath(int64(1), int64(2), '?')
+		res, err := evalMath(int64(1), int64(2), '?')
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -602,8 +602,11 @@ func evalMath(lv, rv any, op rune) (any, error) {
 			return li % ri, nil
 		}
 	}
-	lf, _ := toFloat(lv)
-	rf, _ := toFloat(rv)
+	lf, okL := toFloat(lv)
+	rf, okR := toFloat(rv)
+	if !okL || !okR {
+		return nil, fmt.Errorf("invalid arithmetic %c between %T and %T", op, lv, rv)
+	}
 	switch op {
 	case '+':
 		return lf + rf, nil
@@ -616,6 +619,8 @@ func evalMath(lv, rv any, op rune) (any, error) {
 			return nil, errors.New("div by zero")
 		}
 		return lf / rf, nil
+	case '%':
+		return nil, errors.New("float modulo not supported")
 	}
 	return nil, nil
 }
@@ -960,10 +965,17 @@ func defaultFuncs() map[string]CustomFunc {
 	return map[string]CustomFunc{
 		"len": func(args []any) (any, error) {
 			if len(args) == 0 {
-				return 0, nil
+				return int64(0), nil
 			}
 			rv := reflect.ValueOf(args[0])
-			if rv.Kind() == reflect.Slice || rv.Kind() == reflect.String || rv.Kind() == reflect.Map {
+			for rv.Kind() == reflect.Pointer {
+				if rv.IsNil() {
+					return int64(0), nil
+				}
+				rv = rv.Elem()
+			}
+			switch rv.Kind() {
+			case reflect.Slice, reflect.Array, reflect.Map, reflect.String:
 				return int64(rv.Len()), nil
 			}
 			return int64(0), nil
@@ -1005,26 +1017,50 @@ func (e *Engine) RegisterFunc(name string, fn CustomFunc) error {
 	return nil
 }
 
-func (e *Engine) Eval(exprStr string, data any) (res any, err error) {
+// Program is a parsed expression bound to the Engine it was compiled on.
+// Parsing is done once; Eval can then be called repeatedly against different
+// data without re-lexing/re-parsing, which is the common rules-engine pattern
+// of evaluating one rule many times. It always reads the latest registered
+// funcs from its Engine, so RegisterFunc still takes effect after Compile.
+type Program struct {
+	ast    Expr
+	engine *Engine
+}
+
+// Compile parses exprStr once and returns a reusable Program. Parse-time
+// panics are recovered and returned as errors, mirroring Eval.
+func (e *Engine) Compile(exprStr string) (prog *Program, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			prog = nil
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
+	ast, err := ParseExpr(exprStr)
+	if err != nil {
+		return nil, err
+	}
+	return &Program{ast: ast, engine: e}, nil
+}
+
+// Eval evaluates a compiled Program against data. Evaluation panics are
+// recovered and returned as errors.
+func (p *Program) Eval(data any) (res any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("panic: %v", r)
 			res = nil
 		}
 	}()
+	return p.ast.Eval(Context{Data: data, Fns: p.engine.loadFuncs()})
+}
 
-	l := &lexer{s: exprStr}
-	p := &parser{lex: l}
-	p.advance()
-	p.advance()
-	ast, err := p.parse(0, 0)
+func (e *Engine) Eval(exprStr string, data any) (res any, err error) {
+	prog, err := e.Compile(exprStr)
 	if err != nil {
 		return nil, err
 	}
-	if p.curr.typ != tEOF {
-		return nil, fmt.Errorf("unexpected token %q at %d", p.curr.val, p.curr.pos)
-	}
-	return ast.Eval(Context{Data: data, Fns: e.loadFuncs()})
+	return prog.Eval(data)
 }
 
 func toInt64(v any) (int64, bool) {
