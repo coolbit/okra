@@ -1,4 +1,4 @@
-package core
+package okra
 
 import (
 	"errors"
@@ -812,12 +812,22 @@ func TestNilOnUse(t *testing.T) {
 		"m": map[string]any{"x": nil}, // present key whose value is nil
 	}
 
-	// nil can be a final result and can be consumed by get/has.
-	if v, err := e.Eval("get(m, 'x', 'dflt')", data); err != nil || v != nil {
-		t.Fatalf("get present-nil: got %v, %v (want nil)", v, err)
-	}
+	// has is structural: the key is there (even though its value is nil).
 	if v, err := e.Eval("has(m, 'x')", data); err != nil || v != true {
 		t.Fatalf("has present-nil: got %v, %v", v, err)
+	}
+	// get is value-level: a present-but-nil member yields the default, so
+	// get(...) is always safe to feed into an operation.
+	if v, err := e.Eval("get(m, 'x', 'dflt')", data); err != nil || v != "dflt" {
+		t.Fatalf("get present-nil: got %v, %v (want dflt)", v, err)
+	}
+	if v, err := e.Eval("get(m, 'x', 1) + 1", data); err != nil || v != int64(2) {
+		t.Fatalf("get feeds an op safely: got %v, %v", v, err)
+	}
+
+	// nil can still be a final result (returned to the Go caller as-is).
+	if v, err := e.Eval("m.x", data); err != nil || v != nil {
+		t.Fatalf("nil final result: got %v, %v", v, err)
 	}
 
 	// But taking that nil into an operation is an error, never a silent 0/false.
@@ -826,9 +836,80 @@ func TestNilOnUse(t *testing.T) {
 		"m.x > 0",     // comparison
 		"m.x ? 1 : 2", // condition
 		"m.x.y",       // further member access
+		"1 in m.x",    // nil as a container
+		"len(m.x)",    // len of nil
 	} {
 		if _, err := e.Eval(src, data); err == nil {
 			t.Fatalf("%s: expected an error using nil in an operation", src)
 		}
+	}
+
+	// Equality is the one exemption: it always has an answer, for nil and for
+	// mixed types alike (they simply compare unequal).
+	if v, err := e.Eval("m.x == 1", data); err != nil || v != false {
+		t.Fatalf("nil == 1: got %v, %v", v, err)
+	}
+	if v, err := e.Eval("m.x != 1", data); err != nil || v != true {
+		t.Fatalf("nil != 1: got %v, %v", v, err)
+	}
+}
+
+// --- fail-loud builtins: no silent stringification, no len()=0 -----------------
+
+func TestBuiltinsAreStrict(t *testing.T) {
+	e := NewEngine()
+	// String builtins require real strings — no fmt.Sprint coercion.
+	for _, src := range []string{
+		"contains(123, '2')",
+		"contains('abc', 1)",
+		"startsWith(1, '1')",
+		"endsWith('a', 5)",
+		"lower(456)",
+		"upper(true)",
+		"trim(1.5)",
+	} {
+		if _, err := e.Eval(src, nil); err == nil {
+			t.Fatalf("%s: expected a type error", src)
+		}
+	}
+	// len: wrong arity and non-sized types are errors.
+	for _, src := range []string{"len()", "len(5)", "len(true)", "len('a', 'b')"} {
+		if _, err := e.Eval(src, nil); err == nil {
+			t.Fatalf("%s: expected an error", src)
+		}
+	}
+	// The valid forms still work.
+	if v, err := e.Eval("len('abc')", nil); err != nil || v != int64(3) {
+		t.Fatalf("len('abc'): got %v, %v", v, err)
+	}
+	if v, err := e.Eval("contains('hello', 'ell')", nil); err != nil || v != true {
+		t.Fatalf("contains: got %v, %v", v, err)
+	}
+}
+
+// --- error annotation: failures name the sub-expression that produced them -----
+
+func TestErrorsNameFailingSubexpression(t *testing.T) {
+	e := NewEngine()
+	data := map[string]any{
+		"user": map[string]any{"Age": int64(30), "Name": "Alice"},
+	}
+	// A long rule with several comparisons: the error must point at the one that
+	// failed, and only once (no re-wrapping at every level on the way up).
+	_, err := e.Eval("user.Age > 18 && user.Age > user.Name && user.Age < 65", data)
+	if err == nil {
+		t.Fatal("expected a comparison type error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "user.Age > user.Name") {
+		t.Fatalf("error should name the failing sub-expression, got: %v", msg)
+	}
+	if strings.Count(msg, "user.Age < 65") != 0 {
+		t.Fatalf("error should not drag in unrelated sub-expressions, got: %v", msg)
+	}
+
+	// Sentinel matching still works through the annotation (%w).
+	if _, err := e.Eval("true && (1/0 == 1)", nil); !errors.Is(err, ErrDivByZero) {
+		t.Fatalf("expected ErrDivByZero through annotation, got %v", err)
 	}
 }

@@ -10,7 +10,7 @@ package main
 import (
     "fmt"
 
-    "okra/core"
+    "github.com/coolbit/okra"
 )
 
 type User struct {
@@ -19,7 +19,7 @@ type User struct {
 }
 
 func main() {
-    e := core.NewEngine()
+    e := okra.NewEngine()
     data := map[string]any{
         "user": &User{Name: "Alice", Age: 25},
         "arr":  []int{10, 20, 30},
@@ -86,7 +86,7 @@ Identifiers may contain Unicode letters, so non-ASCII field and map-key names wo
 | `[]T` / `[N]T` | `arr.0` or `arr[0]` | Index access; invalid/out-of-range is an error in strict mode (the default), else `nil` | `nums.1`, `nums[1]` |
 | pointers | auto-dereference | Nil pointers are an error in strict mode (the default), else `nil` (except special cases like `len`) | `ptr.Field`, `ptr.Method()` |
 
-Field promotion follows Go's rules: a directly-declared field shadows a promoted one of the same name (reach the shadowed field explicitly, e.g. `user.Base.Name`). Only **exported** embedded structs are traversed — reflecting through an unexported field would panic — and a promoted field reached through a `nil` embedded pointer resolves to `nil` (or errors in strict mode).
+Field promotion follows Go's rules: a directly-declared field shadows a promoted one of the same name (reach the shadowed field explicitly, e.g. `user.Base.Name`). Only **exported** embedded structs are traversed — reflecting through an unexported field would panic — and a promoted field reached through a `nil` embedded pointer is an error in strict mode (the default), else `nil`.
 
 ### About `arr[0]`
 
@@ -99,11 +99,11 @@ Okra supports bracket indexing like `arr[0]` and it also supports **index expres
 
 | Name | Signature / return | Supported inputs | Example | Example result |
 |---|---|---|---|---|
-| `len` | `len(x) -> int64`; `len() -> int64(0)` | `slice` / `array` / `string` / `map` (pointers are dereferenced; other types return `int64(0)`) | `len(tags)`, `len()` | `int64(2)`, `int64(0)` |
+| `len` | `len(x) -> int64` | `slice` / `array` / `string` / `map` (pointers are dereferenced); any other type — or no argument — is an **error** | `len(tags)`, `len(5)` | `int64(2)`, error |
 | `now` | `now() -> int64` | none | `now()` | Unix seconds |
-| `has` | `has(obj, name) -> bool` | `name` is a string field/map-key/index name; resolves fields, map keys, indexes (never methods) without a strict-mode error | `has(user, 'Coupon')` | `true` / `false` |
-| `get` | `get(obj, name, default) -> any` | as `has`; returns the member if present, otherwise `default` | `get(scores, 'math', 0)` | value or `default` |
-| `contains` | `contains(s, sub) -> bool` | strings (non-strings coerced via `fmt.Sprint`) | `contains('hello', 'ell')` | `true` |
+| `has` | `has(obj, name) -> bool` | `name` is a string field/map-key/index name; resolves fields, map keys, indexes (never methods) without a strict-mode error. **Structural**: true if the member is there, even when its value is nil | `has(user, 'Coupon')` | `true` / `false` |
+| `get` | `get(obj, name, default) -> any` | as `has`, but **value-level**: a missing member *or* a nil value both yield `default`, so `get(...)` is always safe to feed into an operation | `get(scores, 'math', 0)` | value or `default` |
+| `contains` | `contains(s, sub) -> bool` | strings only (no coercion) | `contains('hello', 'ell')` | `true` |
 | `startsWith` | `startsWith(s, prefix) -> bool` | strings | `startsWith('hello', 'he')` | `true` |
 | `endsWith` | `endsWith(s, suffix) -> bool` | strings | `endsWith('hello', 'lo')` | `true` |
 | `lower` | `lower(s) -> string` | strings | `lower('HeLLo')` | `"hello"` |
@@ -120,7 +120,7 @@ You can extend (or override) functions on a **single Engine instance**:
 - It only affects the current `Engine`.
 
 ```go
-e := core.NewEngine()
+e := okra.NewEngine()
 
 _ = e.RegisterFunc("add", func(args []any) (any, error) {
     if len(args) != 2 {
@@ -149,7 +149,7 @@ element of a collection. This is the extension point for collection operations
 nor any element placeholder, so you build exactly the semantics you want.
 
 ```go
-type MacroFunc func(ctx core.Context, args []core.Expr) (any, error)
+type MacroFunc func(ctx okra.Context, args []okra.Expr) (any, error)
 ```
 
 A macro is resolved **before** a plain function of the same name and before the
@@ -158,7 +158,7 @@ with each element swapped in as the root data (so a bare field name refers to th
 element — an element-scoping convention chosen by *this* macro, not the language):
 
 ```go
-e.RegisterMacro("any", func(ctx core.Context, args []core.Expr) (any, error) {
+e.RegisterMacro("any", func(ctx okra.Context, args []okra.Expr) (any, error) {
     coll, err := args[0].Eval(ctx)
     if err != nil {
         return nil, err
@@ -197,6 +197,7 @@ The `in` operator (and its negation `not in`) tests membership and never panics.
 | `key in map` | the map contains that key | `'a' in scores` | `true` |
 | `sub in string` | substring test | `'ell' in 'hello'` | `true` |
 | `x not in y` | negation of the above | `4 not in [1, 2, 3]` | `true` |
+| `x in nil` | error — using nil as a container | `1 in missing` | error |
 | other | error | `1 in 2` | error |
 
 ```okra
@@ -349,7 +350,7 @@ out-of-range index, or member/method access on `nil` is an **error**
 than silently resolving to `nil` and steering the rule down the wrong branch:
 
 ```go
-e := core.NewEngine()               // strict by default
+e := okra.NewEngine()               // strict by default
 _, err := e.Eval("user.Naem", data) // errors.Is(err, ErrUnknownField)
 ```
 
@@ -375,13 +376,27 @@ method that returns `nil`, or `get(obj, name, default)`. Okra's rule is **nil ma
 but not be *used***:
 
 - A `nil` may be the **final result** of an expression (handed back to your Go caller,
-  which can deal with it) and may be **consumed** by `has` / `get`.
-- A `nil` that enters any **operation** — arithmetic, comparison, concatenation, a
-  `?:` / `&&` / `||` / `!` condition, or a further member access — is an **error**,
-  never a silent `0` / `false`.
+  which can deal with it) and may be **consumed** by `has` / `get` (`get` turns a nil
+  value into your default).
+- A `nil` that enters any **operation** — arithmetic, comparison, concatenation, `in`,
+  `len`, a `?:` / `&&` / `||` / `!` condition, or a further member access — is an
+  **error**, never a silent `0` / `false`.
+- The one exemption is **equality**: `==` / `!=` always have an answer, for nil and
+  for mixed types alike (they simply compare unequal, and `nil == nil` is `true`).
 
 This complements strict mode: *missing* is an error at access time; a present *nil
 value* is fine to pass around, but *using* it in an operation is an error.
+
+### Error messages name the failing sub-expression
+
+An error born at an operator is annotated with that sub-expression's source form, once,
+at its birthplace — so in a long rule you see *which* part failed:
+
+```
+(user.Age > user.Name): invalid comparison between int64 and string
+```
+
+Sentinel matching with `errors.Is` works through the annotation.
 
 ### Restricting Methods
 

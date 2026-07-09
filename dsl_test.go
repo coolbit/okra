@@ -1,4 +1,4 @@
-package core
+package okra
 
 import (
 	"errors"
@@ -472,12 +472,9 @@ func TestOkra_Evaluation(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error")
 		}
-		res, err := engine.Eval("len(1)", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if res != int64(0) {
-			t.Fatalf("expected 0, got %v", res)
+		// Fail-loud: len of a non-sized type is an error, not 0.
+		if _, err := engine.Eval("len(1)", nil); err == nil {
+			t.Fatal("expected error for len of a number")
 		}
 	})
 
@@ -514,12 +511,9 @@ func (p *panicObj) IsNilPtr(v *int) bool { return v == nil }
 func TestCoverage_EdgeCases(t *testing.T) {
 	t.Run("NewEngine len with 0 args", func(t *testing.T) {
 		engine := NewEngine()
-		res, err := engine.Eval("len()", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if res != int64(0) {
-			t.Fatalf("want int64(0), got %v (%T)", res, res)
+		// Fail-loud: len() with no argument is an arity error, not 0.
+		if _, err := engine.Eval("len()", nil); err == nil {
+			t.Fatal("expected arity error for len()")
 		}
 	})
 

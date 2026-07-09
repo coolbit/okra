@@ -1,4 +1,4 @@
-package core
+package okra
 
 import (
 	"errors"
@@ -205,7 +205,7 @@ func getStructMeta(t reflect.Type) structMeta {
 type LiteralExpr struct{ Value any }
 
 func (e *LiteralExpr) Eval(ctx Context) (any, error) { return e.Value, nil }
-func (e *LiteralExpr) String() string { return renderLiteral(e.Value) }
+func (e *LiteralExpr) String() string                { return renderLiteral(e.Value) }
 
 // renderLiteral formats a value back into okra source syntax so String()
 // round-trips through ParseExpr, including strings (single-quoted) and lists
@@ -479,7 +479,7 @@ func (e *UnaryExpr) Eval(ctx Context) (any, error) {
 	case "!":
 		b, err := asBool(rv)
 		if err != nil {
-			return nil, err
+			return nil, opErr(e, err)
 		}
 		return !b, nil
 	case "-":
@@ -489,11 +489,11 @@ func (e *UnaryExpr) Eval(ctx Context) (any, error) {
 		if f, ok := toNumber(rv); ok {
 			return -f, nil
 		}
-		return nil, fmt.Errorf("invalid unary - for %T", rv)
+		return nil, opErr(e, fmt.Errorf("invalid unary - for %T", rv))
 	case "~":
 		i, ok := toInt64(rv)
 		if !ok {
-			return nil, fmt.Errorf("invalid unary ~ for %T", rv)
+			return nil, opErr(e, fmt.Errorf("invalid unary ~ for %T", rv))
 		}
 		return ^i, nil
 	default:
@@ -511,6 +511,19 @@ type InfixExpr struct {
 	Right Expr
 }
 
+// opErr annotates an error born at this node with the node's source form, so a
+// failure inside a long rule points at the sub-expression that produced it
+// (e.g. `(user.Age > user.Name): invalid comparison ...`). Errors propagated
+// from child nodes are NOT re-wrapped — they were annotated at their
+// birthplace — so a deep failure carries exactly one location. Wrapping uses
+// %w, so errors.Is on the sentinel errors keeps working.
+func opErr(e Expr, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", e.String(), err)
+}
+
 func (e *InfixExpr) Eval(ctx Context) (any, error) {
 	lv, err := e.Left.Eval(ctx)
 	if err != nil {
@@ -519,7 +532,7 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 	if e.Op == "&&" {
 		lb, err := asBool(lv)
 		if err != nil {
-			return nil, err
+			return nil, opErr(e, err)
 		}
 		if !lb {
 			return false, nil
@@ -528,12 +541,13 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return asBool(rv)
+		rb, err := asBool(rv)
+		return rb, opErr(e, err)
 	}
 	if e.Op == "||" {
 		lb, err := asBool(lv)
 		if err != nil {
-			return nil, err
+			return nil, opErr(e, err)
 		}
 		if lb {
 			return true, nil
@@ -542,12 +556,22 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return asBool(rv)
+		rb, err := asBool(rv)
+		return rb, opErr(e, err)
 	}
 	rv, err := e.Right.Eval(ctx)
 	if err != nil {
 		return nil, err
 	}
+	v, err := e.apply(lv, rv)
+	if err != nil {
+		return nil, opErr(e, err)
+	}
+	return v, nil
+}
+
+// apply computes the non-short-circuit operators on already-evaluated operands.
+func (e *InfixExpr) apply(lv, rv any) (any, error) {
 	switch e.Op {
 	case "==":
 		return valuesEqual(lv, rv), nil
@@ -630,10 +654,11 @@ func isStringVal(v any) bool {
 }
 
 // evalIn implements `needle in haystack`: membership over slice/array
-// elements or map keys, and substring for strings. It never panics.
+// elements or map keys, and substring for strings. It never panics. Using nil
+// as the container is an error (nil-on-use), never a silent false.
 func evalIn(needle, haystack any) (any, error) {
 	if haystack == nil {
-		return false, nil
+		return nil, errors.New("invalid 'in': container is nil")
 	}
 	if hs, ok := haystack.(string); ok {
 		sub, ok := needle.(string)
@@ -645,7 +670,7 @@ func evalIn(needle, haystack any) (any, error) {
 	rv := reflect.ValueOf(haystack)
 	for rv.Kind() == reflect.Pointer {
 		if rv.IsNil() {
-			return false, nil
+			return nil, errors.New("invalid 'in': container is nil")
 		}
 		rv = rv.Elem()
 	}
@@ -684,7 +709,7 @@ func (e *TernaryExpr) Eval(ctx Context) (any, error) {
 	}
 	b, err := asBool(cond)
 	if err != nil {
-		return nil, err
+		return nil, opErr(e.Cond, err)
 	}
 	if b {
 		return e.Then.Eval(ctx)
@@ -808,6 +833,21 @@ func memberLookup(obj any, name string) (any, bool) {
 		}
 	}
 	return nil, false
+}
+
+// isNilValue reports whether v is nil in the useful sense: the untyped nil, or
+// a typed nil pointer/map/slice/etc boxed in an interface. get() uses it so a
+// present-but-nil member still yields the caller's default.
+func isNilValue(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Interface, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	}
+	return false
 }
 
 // hasMethod reports whether obj (or its addressable pointer form) has an
@@ -1446,8 +1486,8 @@ type methodPolicy struct{ fn func(name string) bool }
 func defaultFuncs() map[string]CustomFunc {
 	return map[string]CustomFunc{
 		"len": func(args []any) (any, error) {
-			if len(args) == 0 {
-				return int64(0), nil
+			if len(args) != 1 {
+				return nil, fmt.Errorf("len: expected 1 arg, got %d", len(args))
 			}
 			rv := reflect.ValueOf(args[0])
 			for rv.Kind() == reflect.Pointer {
@@ -1460,7 +1500,8 @@ func defaultFuncs() map[string]CustomFunc {
 			case reflect.Slice, reflect.Array, reflect.Map, reflect.String:
 				return int64(rv.Len()), nil
 			}
-			return int64(0), nil
+			// Fail-loud: len of a non-sized type (or nil) is an error, not 0.
+			return nil, fmt.Errorf("len: unsupported type %T", args[0])
 		},
 		"now": func(args []any) (any, error) { return time.Now().Unix(), nil },
 		// has(obj, 'name') and get(obj, 'name', default) are the sanctioned way to
@@ -1468,6 +1509,11 @@ func defaultFuncs() map[string]CustomFunc {
 		// take the member NAME as a string (has(user, 'Coupon'), not
 		// has(user.Coupon)) and resolve fields / map keys / indexes only — never
 		// methods — without triggering a strict-mode error.
+		//
+		// The two are deliberately orthogonal: has asks "is the member THERE"
+		// (structural — true even if the value is nil), get asks "give me a USABLE
+		// value" (value-level — a missing member or a nil value both yield the
+		// default, so get(...) is always safe to feed into an operation).
 		"has": func(args []any) (any, error) {
 			if len(args) != 2 {
 				return nil, fmt.Errorf("has: expected 2 args (obj, name), got %d", len(args))
@@ -1487,7 +1533,7 @@ func defaultFuncs() map[string]CustomFunc {
 			if !ok {
 				return nil, fmt.Errorf("get: name must be a string, got %T", args[1])
 			}
-			if v, found := memberLookup(args[0], name); found {
+			if v, found := memberLookup(args[0], name); found && !isNilValue(v) {
 				return v, nil
 			}
 			return args[2], nil
@@ -1501,13 +1547,13 @@ func defaultFuncs() map[string]CustomFunc {
 	}
 }
 
-// asString coerces an argument to a string, accepting Go strings directly and
-// otherwise falling back to fmt.Sprint so numbers/bools are usable too.
-func asString(v any) string {
+// asString requires v to already be a string. Like the operators, the string
+// builtins never coerce other types (no silent fmt.Sprint of numbers/bools).
+func asString(name string, v any) (string, error) {
 	if s, ok := v.(string); ok {
-		return s
+		return s, nil
 	}
-	return fmt.Sprint(v)
+	return "", fmt.Errorf("%s: expected string, got %T", name, v)
 }
 
 func strBinFunc(name string, fn func(string, string) bool) CustomFunc {
@@ -1515,7 +1561,15 @@ func strBinFunc(name string, fn func(string, string) bool) CustomFunc {
 		if len(args) != 2 {
 			return nil, fmt.Errorf("%s: expected 2 args, got %d", name, len(args))
 		}
-		return fn(asString(args[0]), asString(args[1])), nil
+		a, err := asString(name, args[0])
+		if err != nil {
+			return nil, err
+		}
+		b, err := asString(name, args[1])
+		if err != nil {
+			return nil, err
+		}
+		return fn(a, b), nil
 	}
 }
 
@@ -1524,7 +1578,11 @@ func strUnaryFunc(name string, fn func(string) string) CustomFunc {
 		if len(args) != 1 {
 			return nil, fmt.Errorf("%s: expected 1 arg, got %d", name, len(args))
 		}
-		return fn(asString(args[0])), nil
+		s, err := asString(name, args[0])
+		if err != nil {
+			return nil, err
+		}
+		return fn(s), nil
 	}
 }
 
