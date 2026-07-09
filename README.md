@@ -81,7 +81,7 @@ Identifiers may contain Unicode letters, so non-ASCII field and map-key names wo
 |---|---|---|---|
 | `struct` / `*struct` | `user.Field` | Field access, including `okra` / `json` tag names; fields promoted from **exported embedded** structs are reachable too | `user.Name`, `user.name_tag`, `user.EmbeddedID` |
 | `struct` / `*struct` | `user.Method(args...)` | Method call via reflection | `user.SayHi('hi')` |
-| `struct` / `*struct` | `user.Method` | Getter-style: only if method has **0 inputs** and **>=1 outputs** | `user.MultiReturn` |
+| `struct` / `*struct` | `user.Method` | Getter-style: only if method has **0 inputs** and **>=1 outputs**; a trailing `error` return surfaces exactly as it would for `user.Method()` | `user.MultiReturn` |
 | `map[K]V` | `m.key` or `m[key]` | `key` is a string; if `K` is numeric, Okra tries to parse numeric keys from strings | `scores.1`, `scores[1]` |
 | `[]T` / `[N]T` | `arr.0` or `arr[0]` | Index access; invalid/out-of-range is an error in strict mode (the default), else `nil` | `nums.1`, `nums[1]` |
 | pointers | auto-dereference | Nil pointers are an error in strict mode (the default), else `nil` (except special cases like `len`) | `ptr.Field`, `ptr.Method()` |
@@ -223,11 +223,20 @@ an error** (see [nil](#nil)).
 | `+` (numbers) | integer path if both int-like, else float path | `1 + 2`, `1.5 + 2` | `int64(3)`, `3.5` |
 | `+` (strings) | **string + string** concatenates; any string/number mix is an error | `'a' + 'b'`, `'res:' + 10` | `"ab"`, **error** |
 | `- * /` | numbers only | `10 - 3`, `2.0 * 3.5` | `int64(7)`, `7.0` |
-| `/` | division by zero → `ErrDivByZero` | `10 / 0` | error |
+| `/` | division by zero → `ErrDivByZero`; **integer / integer truncates** | `10 / 0`, `10 / 4` | error, `int64(2)` |
 | `%` | integers; `ErrModByZero`, float modulo → `ErrFloatModulo` | `10 % 3`, `1.2 % 2.0` | `int64(1)`, error |
 
 An operand that is not a number (a string, `nil`, …) makes arithmetic an error rather
 than silently yielding `0`.
+
+**Checked arithmetic**: integer `+ - * /` (and unary `-`) that would overflow `int64`
+return `ErrIntOverflow` — never a silent two's-complement wrap. Bitwise operators
+(`& | ^ << >>`) are exempt: wrapping is their intended semantics. A host `uint64`
+larger than `MaxInt64` is not reinterpreted as negative; it is simply not a usable
+number, so arithmetic/comparison with it errors.
+
+Note that `10 / 4` is `int64(2)` (truncating integer division, as in Go/SQL/CEL); use
+a float operand (`10 / 4.0`) for float division.
 
 ### Comparison: `> < >= <=`
 
@@ -250,6 +259,12 @@ numbers (compared numerically). A string is never coerced to a number.
 Equality is the one place mixed types are allowed without error: they simply compare
 unequal. A string is never numerically equal to a number (`1 == '1'` is `false`),
 while two numbers of different kinds compare by value (`10 == 10.0` is `true`).
+
+**Lists compare element-wise with these same rules**, so scalar equality lifts into
+them: `[1] == [1.0]` is `true`, `['1'] == [1]` is `false`, and length mismatch
+short-circuits to `false`. Other composites (maps, structs) fall back to
+`reflect.DeepEqual`. Self-referential data is safe (past a depth limit the comparison
+falls back to `DeepEqual`, which handles cycles).
 
 ### Logical: `&& ||` (short-circuit)
 
@@ -310,10 +325,37 @@ At compile time, sub-expressions built entirely from literals are **constant-fol
 A subtree that errors when folded (like `1 / 0`) is left intact so the error still
 surfaces at eval time.
 
+### Cancellation and Deadlines (`EvalContext`)
+
+`Program.EvalContext(ctx, data)` is `Eval` with cooperative cancellation: evaluation
+counts its work in steps (one per AST node visited and per element scanned by `in`)
+and polls `ctx` roughly every 1024 steps, returning `ctx.Err()` once the context is
+cancelled or its deadline passes. Use it when rules may scan large collections inside
+a latency budget — a goroutine cannot be killed from outside, so this cooperative
+check is the only way to actually stop a long evaluation rather than merely abandon
+it.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+defer cancel()
+v, err := prog.EvalContext(ctx, data) // errors.Is(err, context.DeadlineExceeded) on timeout
+```
+
+Macros that copy the `Context` (`child := ctx`) inherit the cancellation state, so
+userland collection loops stay cancellable too. Plain `Eval` skips all of this and
+pays no overhead.
+
 ### Inspecting a Program
 
 - `prog.Vars() []string` — the distinct **root** variable identifiers the program reads (the base of each access chain, so `user.Age` reports `user`, not the full path `user.Age`). Useful for validating which top-level objects a rule needs, or building dependency indexes, before running it.
 - `prog.Funcs() []string` — the distinct function and method names the program calls (bare calls like `contains(...)` and method calls like `user.Save()`).
+
+**Macro caveat**: macro arguments are collected like any other expression. A macro
+that re-roots its arguments — e.g. a collection predicate evaluated per element, so in
+`any(orders, price > 100)` the `price` is element-relative — makes those identifiers
+*not* root variables, yet `Vars()` still reports them. Static analysis is inherently
+unreliable inside macro arguments; treat `Vars()`/`Funcs()` as exact only for
+macro-free expressions.
 
 ```go
 prog, _ := e.Compile("user.Age > 18 && contains(user.Name, 'a')")
@@ -337,6 +379,7 @@ Okra never crashes the host application — every public entry point (`Eval`, `C
 Several errors are exported so callers can match them with `errors.Is`, even though they are wrapped with context:
 
 - `ErrDivByZero`, `ErrModByZero`, `ErrFloatModulo`
+- `ErrIntOverflow` (checked integer arithmetic)
 - `ErrNegativeShift`
 - `ErrNotFound` (unknown function or method)
 - `ErrUnknownField` (strict-mode missing field/key/index)

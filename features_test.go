@@ -1,8 +1,10 @@
 package okra
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -911,5 +913,162 @@ func TestErrorsNameFailingSubexpression(t *testing.T) {
 	// Sentinel matching still works through the annotation (%w).
 	if _, err := e.Eval("true && (1/0 == 1)", nil); !errors.Is(err, ErrDivByZero) {
 		t.Fatalf("expected ErrDivByZero through annotation, got %v", err)
+	}
+}
+
+// --- checked integer arithmetic ------------------------------------------------
+
+func TestIntegerOverflow(t *testing.T) {
+	e := NewEngine()
+	data := map[string]any{
+		"max": int64(math.MaxInt64),
+		"min": int64(math.MinInt64),
+		"big": uint64(math.MaxUint64), // beyond MaxInt64
+	}
+	// Overflow is an error (ErrIntOverflow), never a silent wrap.
+	for _, src := range []string{
+		"max + 1",
+		"min - 1",
+		"max * 2",
+		"min / -1",
+		"-min",
+	} {
+		if _, err := e.Eval(src, data); !errors.Is(err, ErrIntOverflow) {
+			t.Fatalf("%s: expected ErrIntOverflow, got %v", src, err)
+		}
+	}
+	// Non-overflowing boundary cases still work.
+	if v, err := e.Eval("max + 0", data); err != nil || v != int64(math.MaxInt64) {
+		t.Fatalf("max + 0: got %v, %v", v, err)
+	}
+	if v, err := e.Eval("max - 1 + 1", data); err != nil || v != int64(math.MaxInt64) {
+		t.Fatalf("max - 1 + 1: got %v, %v", v, err)
+	}
+	// A uint64 beyond MaxInt64 is not silently reinterpreted as negative: it is
+	// simply not a usable number, so arithmetic/comparison with it errors.
+	for _, src := range []string{"big + 1", "big > 0"} {
+		if _, err := e.Eval(src, data); err == nil {
+			t.Fatalf("%s: expected an error for oversized uint64", src)
+		}
+	}
+	// Bitwise operators keep wrapping semantics (that is their meaning).
+	if v, err := e.Eval("1 << 63", nil); err != nil || v != int64(math.MinInt64) {
+		t.Fatalf("1 << 63: got %v, %v", v, err)
+	}
+}
+
+// --- list equality lifts scalar equality ---------------------------------------
+
+func TestListEquality(t *testing.T) {
+	e := NewEngine()
+	cases := []struct {
+		expr string
+		want any
+	}{
+		{"[1] == [1.0]", true}, // element-wise uses scalar rules: 1 == 1.0
+		{"[1, 2] == [1, 2]", true},
+		{"[1, 2] == [1, 3]", false},
+		{"[1] == [1, 2]", false}, // length short-circuits
+		{"[[1]] == [[1.0]]", true},
+		{"['a'] == ['a']", true},
+		{"['1'] == [1]", false}, // a string never equals a number, in lists too
+		{"1.0 in [1, 2]", true}, // in uses the same lifted equality
+		{"[1.0] in [[1]]", true},
+	}
+	for _, c := range cases {
+		got, err := e.Eval(c.expr, nil)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v, err %v, want %v", c.expr, got, err, c.want)
+		}
+	}
+
+	// Self-referential data must not crash the process (stack overflow is
+	// fatal): past the depth limit the comparison falls back to DeepEqual,
+	// whose visited-set handles cycles.
+	a := make([]any, 1)
+	a[0] = a
+	b := make([]any, 1)
+	b[0] = b
+	if _, err := e.Eval("a == b", map[string]any{"a": a, "b": b}); err != nil {
+		t.Fatalf("cyclic equality: unexpected error %v", err)
+	}
+}
+
+// --- cooperative cancellation (EvalContext) -------------------------------------
+
+func TestEvalContext(t *testing.T) {
+	e := NewEngine()
+
+	// A normal evaluation under a live context works as usual.
+	prog, err := e.Compile("1 + 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := prog.EvalContext(context.Background(), nil); err != nil || v != int64(3) {
+		t.Fatalf("background ctx: got %v, %v", v, err)
+	}
+
+	// A context cancelled before evaluation aborts immediately.
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := prog.EvalContext(cancelled, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-cancelled: expected context.Canceled, got %v", err)
+	}
+
+	// Cancellation lands mid-evaluation: a custom func cancels the context,
+	// then the `in` scan over a large slice must notice at its next poll
+	// instead of finishing the scan.
+	ctx, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	if err := e.RegisterFunc("cancelnow", func([]any) (any, error) {
+		cancel2()
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	big := make([]int64, 100_000)                        // all zeros; needle never matches
+	prog2, err := e.Compile("cancelnow() && (1 in big)") // compiled AFTER registration
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prog2.EvalContext(ctx, map[string]any{"big": big}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("mid-eval: expected context.Canceled, got %v", err)
+	}
+
+	// Plain Eval is unaffected by all of this.
+	if v, err := prog2.Eval(map[string]any{"big": big}); err != nil || v != false {
+		t.Fatalf("plain Eval: got %v, %v", v, err)
+	}
+}
+
+// --- getter-style access surfaces errors ----------------------------------------
+
+type getterObj struct{ fail bool }
+
+func (g getterObj) Val() (int, error) {
+	if g.fail {
+		return 0, fmt.Errorf("boom")
+	}
+	return 42, nil
+}
+
+func (g getterObj) Panicky() int { panic("getter panic") }
+
+func TestGetterErrorsSurface(t *testing.T) {
+	e := NewEngine()
+
+	// A getter's trailing error return propagates — identical to calling it
+	// with parentheses — instead of being silently discarded.
+	if _, err := e.Eval("g.Val", map[string]any{"g": getterObj{fail: true}}); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("expected boom, got %v", err)
+	}
+	if v, err := e.Eval("g.Val", map[string]any{"g": getterObj{}}); err != nil || v != 42 {
+		t.Fatalf("healthy getter: got %v, %v", v, err)
+	}
+
+	// A panicking getter is recovered with the method name in the message.
+	_, err := e.Eval("g.Panicky", map[string]any{"g": getterObj{}})
+	if err == nil || !strings.Contains(err.Error(), "panic calling Panicky") {
+		t.Fatalf("expected recovered panic naming the getter, got %v", err)
 	}
 }

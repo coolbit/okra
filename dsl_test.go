@@ -1160,9 +1160,11 @@ func TestCoverage_EdgeCases(t *testing.T) {
 	})
 
 	t.Run("InfixExpr unknown op", func(t *testing.T) {
+		// Hand-built ASTs with an operator the parser never produces must fail
+		// loudly, not resolve to a silent nil.
 		i := &InfixExpr{Left: &LiteralExpr{Value: 1}, Op: "@", Right: &LiteralExpr{Value: 2}}
-		if v, err := i.Eval(Context{}); err != nil || v != nil {
-			t.Fatalf("unexpected: %v %v", v, err)
+		if _, err := i.Eval(Context{}); err == nil {
+			t.Fatal("expected error for unknown operator")
 		}
 	})
 }

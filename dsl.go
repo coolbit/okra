@@ -1,9 +1,11 @@
 package okra
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"reflect"
 	"sort"
 	"strconv"
@@ -29,6 +31,10 @@ var (
 	ErrFloatModulo   = errors.New("float modulo not supported")
 	ErrNegativeShift = errors.New("negative shift count")
 	ErrNotFound      = errors.New("function or method not found")
+	// ErrIntOverflow is returned when integer + - * / (or unary -) would
+	// overflow int64. Arithmetic never silently wraps; bitwise operators are
+	// exempt (wrapping is their intended semantics).
+	ErrIntOverflow = errors.New("integer overflow")
 	// ErrUnknownField is returned in strict mode for a missing struct field,
 	// map key, or out-of-range/nil access.
 	ErrUnknownField = errors.New("unknown field or key")
@@ -61,6 +67,27 @@ type Context struct {
 	// MethodFilter, when non-nil, gates every reflected method and getter
 	// invocation: names for which it returns false are denied. Nil allows all.
 	MethodFilter func(name string) bool
+
+	// ctx and steps drive cooperative cancellation for Program.EvalContext:
+	// every node evaluation (and every element scanned by `in`) counts one
+	// step, and every 1024th step polls ctx.Err(). Both are nil under plain
+	// Eval, making step() a no-op. Macros that copy the Context (child := ctx)
+	// inherit them, so userland collection loops stay cancellable too.
+	ctx   context.Context
+	steps *uint64
+}
+
+// step counts one unit of evaluation work and periodically checks whether the
+// evaluation has been cancelled. It is (nearly) free unless EvalContext is used.
+func (c Context) step() error {
+	if c.steps == nil {
+		return nil
+	}
+	*c.steps++
+	if *c.steps&1023 == 0 {
+		return c.ctx.Err()
+	}
+	return nil
 }
 
 // methodAllowed reports whether calling the named method/getter is permitted.
@@ -233,6 +260,9 @@ func renderLiteral(v any) string {
 type ListExpr struct{ Elems []Expr }
 
 func (e *ListExpr) Eval(ctx Context) (any, error) {
+	if err := ctx.step(); err != nil {
+		return nil, err
+	}
 	out := make([]any, len(e.Elems))
 	for i, el := range e.Elems {
 		v, err := el.Eval(ctx)
@@ -254,6 +284,9 @@ func (e *ListExpr) String() string {
 type VariableExpr struct{ Name string }
 
 func (e *VariableExpr) Eval(ctx Context) (any, error) {
+	if err := ctx.step(); err != nil {
+		return nil, err
+	}
 	return getMember(ctx, ctx.Data, e.Name)
 }
 func (e *VariableExpr) String() string { return e.Name }
@@ -264,6 +297,9 @@ type MemberAccessExpr struct {
 }
 
 func (e *MemberAccessExpr) Eval(ctx Context) (any, error) {
+	if err := ctx.step(); err != nil {
+		return nil, err
+	}
 	val, err := e.Left.Eval(ctx)
 	if err != nil {
 		return nil, err
@@ -283,6 +319,9 @@ type IndexExpr struct {
 }
 
 func (e *IndexExpr) Eval(ctx Context) (any, error) {
+	if err := ctx.step(); err != nil {
+		return nil, err
+	}
 	obj, err := e.Left.Eval(ctx)
 	if err != nil {
 		return nil, err
@@ -365,6 +404,9 @@ type MethodCallExpr struct {
 }
 
 func (e *MethodCallExpr) Eval(ctx Context) (any, error) {
+	if err := ctx.step(); err != nil {
+		return nil, err
+	}
 	obj, err := e.Left.Eval(ctx)
 	if err != nil {
 		return nil, err
@@ -412,18 +454,35 @@ func (e *MethodCallExpr) String() string {
 type CallExpr struct {
 	Name string
 	Args []Expr
+	// lower is Name pre-lowercased by the parser so Eval does not re-lowercase
+	// (and possibly allocate) on every evaluation. Empty on hand-built ASTs, in
+	// which case Eval falls back to lowering at eval time.
+	lower string
+}
+
+// key is the case-insensitive lookup key for functions and macros.
+func (e *CallExpr) key() string {
+	if e.lower != "" {
+		return e.lower
+	}
+	return strings.ToLower(e.Name)
 }
 
 func (e *CallExpr) Eval(ctx Context) (any, error) {
+	if err := ctx.step(); err != nil {
+		return nil, err
+	}
+	name := e.key()
+
 	// 0. Macros receive their arguments UN-evaluated, so they must be resolved
 	// before any argument is touched. This is what lets a userland any/all/filter
 	// re-evaluate a predicate expression per collection element.
-	if m, ok := ctx.Macros[strings.ToLower(e.Name)]; ok {
+	if m, ok := ctx.Macros[name]; ok {
 		return m(ctx, e.Args)
 	}
 
 	// 1. Try to find a global function first
-	fn, ok := ctx.Fns[strings.ToLower(e.Name)]
+	fn, ok := ctx.Fns[name]
 	if ok {
 		args := make([]any, len(e.Args))
 		for i, argExpr := range e.Args {
@@ -471,6 +530,9 @@ type UnaryExpr struct {
 }
 
 func (e *UnaryExpr) Eval(ctx Context) (any, error) {
+	if err := ctx.step(); err != nil {
+		return nil, err
+	}
 	rv, err := e.Right.Eval(ctx)
 	if err != nil {
 		return nil, err
@@ -484,6 +546,9 @@ func (e *UnaryExpr) Eval(ctx Context) (any, error) {
 		return !b, nil
 	case "-":
 		if i, ok := toInt64(rv); ok {
+			if i == math.MinInt64 {
+				return nil, opErr(e, ErrIntOverflow)
+			}
 			return -i, nil
 		}
 		if f, ok := toNumber(rv); ok {
@@ -525,6 +590,9 @@ func opErr(e Expr, err error) error {
 }
 
 func (e *InfixExpr) Eval(ctx Context) (any, error) {
+	if err := ctx.step(); err != nil {
+		return nil, err
+	}
 	lv, err := e.Left.Eval(ctx)
 	if err != nil {
 		return nil, err
@@ -563,7 +631,7 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	v, err := e.apply(lv, rv)
+	v, err := e.apply(ctx, lv, rv)
 	if err != nil {
 		return nil, opErr(e, err)
 	}
@@ -571,7 +639,9 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 }
 
 // apply computes the non-short-circuit operators on already-evaluated operands.
-func (e *InfixExpr) apply(lv, rv any) (any, error) {
+// ctx is only consulted by `in` / `not in`, whose container scan counts steps
+// so a huge collection stays cancellable.
+func (e *InfixExpr) apply(ctx Context, lv, rv any) (any, error) {
 	switch e.Op {
 	case "==":
 		return valuesEqual(lv, rv), nil
@@ -605,21 +675,32 @@ func (e *InfixExpr) apply(lv, rv any) (any, error) {
 	case "&", "|", "^", "<<", ">>":
 		return evalBitwise(lv, rv, e.Op)
 	case "in":
-		return evalIn(lv, rv)
+		return evalIn(ctx, lv, rv)
 	case "not in":
-		v, err := evalIn(lv, rv)
+		v, err := evalIn(ctx, lv, rv)
 		if err != nil {
 			return nil, err
 		}
 		return !v.(bool), nil
 	}
-	return nil, nil
+	// Unreachable through the parser, but hand-built ASTs must fail loudly too.
+	return nil, fmt.Errorf("unknown operator %q", e.Op)
 }
 
-// valuesEqual implements the equality used by == / != / in: exact DeepEqual
-// first, then a numeric comparison when both sides are numbers. A string is
-// never treated as numerically equal to a number (so 1 == '1' is false).
-func valuesEqual(lv, rv any) bool {
+// maxEqualityDepth bounds recursive list equality. In practice only a
+// self-referential structure can reach it; the comparison then falls back to
+// reflect.DeepEqual, whose visited-set handles cycles without overflowing the
+// stack (a Go stack overflow is fatal — recover cannot catch it).
+const maxEqualityDepth = MaxStackDepth
+
+// valuesEqual implements the equality used by == / != / in. Scalars use the
+// language's rules (cross-numeric equality holds, a string never equals a
+// number). Slices/arrays compare element-wise with these same rules, so
+// [1] == [1.0] agrees with 1 == 1.0. Other composites (maps, structs) fall
+// back to reflect.DeepEqual.
+func valuesEqual(lv, rv any) bool { return valuesEqualAt(lv, rv, 0) }
+
+func valuesEqualAt(lv, rv any, depth int) bool {
 	// Fast path for common scalar types, avoiding reflect.DeepEqual.
 	switch l := lv.(type) {
 	case string:
@@ -640,12 +721,32 @@ func valuesEqual(lv, rv any) bool {
 	if isStringVal(lv) || isStringVal(rv) {
 		return false
 	}
+	// Lists compare element-wise so scalar equality lifts into them.
+	lrv, rrv := reflect.ValueOf(lv), reflect.ValueOf(rv)
+	if isSeqKind(lrv.Kind()) && isSeqKind(rrv.Kind()) {
+		if depth >= maxEqualityDepth {
+			return reflect.DeepEqual(lv, rv)
+		}
+		if lrv.Len() != rrv.Len() {
+			return false
+		}
+		for i := 0; i < lrv.Len(); i++ {
+			if !valuesEqualAt(lrv.Index(i).Interface(), rrv.Index(i).Interface(), depth+1) {
+				return false
+			}
+		}
+		return true
+	}
 	if reflect.DeepEqual(lv, rv) {
 		return true
 	}
 	lf, okL := toNumber(lv)
 	rf, okR := toNumber(rv)
 	return okL && okR && lf == rf
+}
+
+func isSeqKind(k reflect.Kind) bool {
+	return k == reflect.Slice || k == reflect.Array
 }
 
 func isStringVal(v any) bool {
@@ -655,8 +756,10 @@ func isStringVal(v any) bool {
 
 // evalIn implements `needle in haystack`: membership over slice/array
 // elements or map keys, and substring for strings. It never panics. Using nil
-// as the container is an error (nil-on-use), never a silent false.
-func evalIn(needle, haystack any) (any, error) {
+// as the container is an error (nil-on-use), never a silent false. Every
+// element scanned counts a cancellation step, so `in` over a huge collection
+// stays responsive to EvalContext.
+func evalIn(ctx Context, needle, haystack any) (any, error) {
 	if haystack == nil {
 		return nil, errors.New("invalid 'in': container is nil")
 	}
@@ -677,14 +780,21 @@ func evalIn(needle, haystack any) (any, error) {
 	switch rv.Kind() {
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < rv.Len(); i++ {
+			if err := ctx.step(); err != nil {
+				return nil, err
+			}
 			if valuesEqual(needle, rv.Index(i).Interface()) {
 				return true, nil
 			}
 		}
 		return false, nil
 	case reflect.Map:
-		for _, k := range rv.MapKeys() {
-			if valuesEqual(needle, k.Interface()) {
+		it := rv.MapRange()
+		for it.Next() {
+			if err := ctx.step(); err != nil {
+				return nil, err
+			}
+			if valuesEqual(needle, it.Key().Interface()) {
 				return true, nil
 			}
 		}
@@ -703,6 +813,9 @@ type TernaryExpr struct {
 }
 
 func (e *TernaryExpr) Eval(ctx Context) (any, error) {
+	if err := ctx.step(); err != nil {
+		return nil, err
+	}
 	cond, err := e.Cond.Eval(ctx)
 	if err != nil {
 		return nil, err
@@ -776,7 +889,10 @@ func getMember(ctx Context, obj any, key string) (any, error) {
 				m = rv.Addr().MethodByName(key)
 			}
 			if m.IsValid() && m.Type().NumIn() == 0 && m.Type().NumOut() > 0 {
-				return m.Call(nil)[0].Interface(), nil
+				// Getter-style access shares the invocation tail with explicit
+				// calls, so a trailing error return (or a panic) surfaces instead
+				// of being silently discarded.
+				return invokeMethod(m, nil, key)
 			}
 		}
 		return ctx.miss("unknown field %q on %s", key, rv.Type())
@@ -914,6 +1030,13 @@ func callReflectMethod(obj any, name string, args []any) (any, error) {
 		}
 	}
 
+	return invokeMethod(mv, in, name)
+}
+
+// invokeMethod calls mv with in, recovering panics and honoring a trailing
+// error return, and yields the first output (or nil). It is shared by explicit
+// method calls and getter-style access, so both surface errors identically.
+func invokeMethod(mv reflect.Value, in []reflect.Value, name string) (any, error) {
 	var out []reflect.Value
 	var panicErr error
 	func() {
@@ -944,16 +1067,36 @@ func evalMath(lv, rv any, op rune) (any, error) {
 	li, okL := toInt64(lv)
 	ri, okR := toInt64(rv)
 	if okL && okR {
+		// Checked arithmetic: overflow is an error (ErrIntOverflow), never a
+		// silent two's-complement wrap. Rule values are amounts, counts, and
+		// timestamps — a wrapped result is always a wrong answer.
 		switch op {
 		case '+':
+			if (ri > 0 && li > math.MaxInt64-ri) || (ri < 0 && li < math.MinInt64-ri) {
+				return nil, ErrIntOverflow
+			}
 			return li + ri, nil
 		case '-':
+			if (ri < 0 && li > math.MaxInt64+ri) || (ri > 0 && li < math.MinInt64+ri) {
+				return nil, ErrIntOverflow
+			}
 			return li - ri, nil
 		case '*':
+			if li != 0 && ri != 0 {
+				if (li == math.MinInt64 && ri == -1) || (ri == math.MinInt64 && li == -1) {
+					return nil, ErrIntOverflow
+				}
+				if r := li * ri; r/ri != li {
+					return nil, ErrIntOverflow
+				}
+			}
 			return li * ri, nil
 		case '/':
 			if ri == 0 {
 				return nil, ErrDivByZero
+			}
+			if li == math.MinInt64 && ri == -1 {
+				return nil, ErrIntOverflow
 			}
 			return li / ri, nil
 		case '%':
@@ -1295,7 +1438,7 @@ func (p *parser) nud(t token, depth int) (Expr, error) {
 			if err != nil {
 				return nil, err
 			}
-			return &CallExpr{t.val, args}, nil
+			return &CallExpr{Name: t.val, Args: args, lower: strings.ToLower(t.val)}, nil
 		}
 		return &VariableExpr{t.val}, nil
 	case tLParen:
@@ -1642,8 +1785,8 @@ func (e *Engine) depthLimit() int {
 
 // SetStrict controls strict lookups: when true, accessing a missing struct
 // field, map key, out-of-range index, or a member of nil returns an error
-// (wrapping ErrUnknownField) instead of nil. Off by default. Safe to call
-// concurrently.
+// (wrapping ErrUnknownField) instead of nil. On by default; pass false to opt
+// into lenient missing→nil resolution. Safe to call concurrently.
 func (e *Engine) SetStrict(strict bool) { e.strict.Store(strict) }
 
 // SetMethodFilter installs a predicate consulted before every reflected method
@@ -1761,9 +1904,43 @@ func (p *Program) Eval(data any) (res any, err error) {
 	})
 }
 
+// EvalContext is Eval with cooperative cancellation: evaluation counts its work
+// in steps (one per AST node visited and per element scanned by `in`) and polls
+// ctx roughly every 1024 steps, returning ctx.Err() once the context is
+// cancelled or its deadline passes. A goroutine cannot be killed from outside,
+// so this cooperative check is the only way to bound a rule that scans a large
+// collection inside a latency budget. The overhead for typical rules is one
+// counter increment per node.
+func (p *Program) EvalContext(ctx context.Context, data any) (res any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+			res = nil
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var steps uint64
+	return p.ast.Eval(Context{
+		Data:         data,
+		Fns:          p.fns,
+		Macros:       p.macros,
+		Strict:       p.strict,
+		MethodFilter: p.methodFilter,
+		ctx:          ctx,
+		steps:        &steps,
+	})
+}
+
 // Vars returns the distinct root variable/field identifiers the program reads
 // from the data object, sorted. Useful for validating a rule against a schema
 // or building dependency indexes before running it.
+//
+// Caveat: macro arguments are collected like any other expression. A macro
+// that re-roots its arguments (e.g. a collection predicate evaluated per
+// element) makes those identifiers element-relative, not root variables —
+// static analysis is inherently unreliable inside macro arguments.
 func (p *Program) Vars() []string {
 	set := map[string]struct{}{}
 	walk(p.ast, func(e Expr) {
@@ -1776,7 +1953,8 @@ func (p *Program) Vars() []string {
 
 // Funcs returns the distinct function and method names the program calls,
 // sorted. This includes bare calls (CallExpr, e.g. contains(...)) and method
-// calls on data (MethodCallExpr, e.g. user.Save()).
+// calls on data (MethodCallExpr, e.g. user.Save()); it does not distinguish
+// macros from plain functions (see the Vars caveat about macro arguments).
 func (p *Program) Funcs() []string {
 	set := map[string]struct{}{}
 	walk(p.ast, func(e Expr) {
@@ -1916,7 +2094,13 @@ func toInt64(v any) (int64, bool) {
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return rv.Int(), true
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return int64(rv.Uint()), true
+		// A uint64 beyond MaxInt64 cannot be represented; refusing it here makes
+		// it a loud arithmetic/comparison error instead of a silent negative.
+		u := rv.Uint()
+		if u > math.MaxInt64 {
+			return 0, false
+		}
+		return int64(u), true
 	default:
 		return 0, false
 	}
