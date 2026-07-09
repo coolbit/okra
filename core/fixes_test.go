@@ -1,6 +1,9 @@
 package core
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestArithmeticErrorsOnNonNumeric(t *testing.T) {
 	e := NewEngine()
@@ -61,7 +64,8 @@ func TestCompileReuse(t *testing.T) {
 		t.Fatalf("second eval: got %v, %v", v, err)
 	}
 
-	// A Program picks up funcs registered after Compile.
+	// A Program is immutable: it snapshots funcs at Compile time, so a func
+	// registered AFTER Compile does not affect it.
 	prog2, err := e.Compile("triple(x)")
 	if err != nil {
 		t.Fatal(err)
@@ -72,8 +76,16 @@ func TestCompileReuse(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if v, err := prog2.Eval(map[string]any{"x": int64(4)}); err != nil || v != int64(12) {
-		t.Fatalf("triple: got %v, %v", v, err)
+	if _, err := prog2.Eval(map[string]any{"x": int64(4)}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("triple after compile: expected ErrNotFound (snapshot), got %v", err)
+	}
+	// Re-compiling after registration picks it up.
+	prog3, err := e.Compile("triple(x)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, err := prog3.Eval(map[string]any{"x": int64(4)}); err != nil || v != int64(12) {
+		t.Fatalf("triple after recompile: got %v, %v", v, err)
 	}
 
 	// Compile-time errors are reported (and recovered) too.

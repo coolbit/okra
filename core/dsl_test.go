@@ -111,7 +111,8 @@ func TestEngine_Eval(t *testing.T) {
 		{"10.5 - 0.5", 10.0, false},
 		{"2.0 * 3.5", 7.0, false},
 		{"10.0 / 4.0", 2.5, false},
-		{"'res: ' + 10", "res: 10", false},
+		{"'res: ' + 10", nil, true}, // strong-typed +: no string/number mixing
+		{"'a' + 'b'", "ab", false},
 		{"10 / 0", nil, true},
 		{"10.5 / 0", nil, true},
 		{"'\\q'", nil, true},
@@ -191,8 +192,8 @@ func TestEngine_Eval(t *testing.T) {
 		{"user.SayHi()", nil, true},
 		{"user.SayHi('a', 'b')", nil, true},
 		{"user.ErrorMethod()", nil, true},
-		{"nil_val.prop", nil, false},
-		{"ptr_nil.Name", nil, false},
+		{"nil_val.prop", nil, true}, // strict is on by default: access on nil errors
+		{"ptr_nil.Name", nil, true},
 		{"1 > 'a'", nil, true},
 		{"unknown_func()", nil, true},
 		{"1 + / 2", nil, true},
@@ -612,6 +613,7 @@ func TestCoverage_EdgeCases(t *testing.T) {
 
 	t.Run("IndexExpr branches", func(t *testing.T) {
 		engine := NewEngine()
+		engine.SetStrict(false) // exercise the lenient nil-resolution paths
 
 		// left eval error
 		_, err := engine.Eval("(1/0)[0]", nil)
@@ -838,9 +840,14 @@ func TestCoverage_EdgeCases(t *testing.T) {
 
 	t.Run("MethodCall nil object", func(t *testing.T) {
 		engine := NewEngine()
+		engine.SetStrict(false) // lenient: method call on nil resolves to nil
 		_, err := engine.Eval("x.len()", map[string]any{"x": nil})
 		if err != nil {
 			t.Fatal(err)
+		}
+		// strict (default): the same call is an error, not a silent nil.
+		if _, err := NewEngine().Eval("x.len()", map[string]any{"x": nil}); err == nil {
+			t.Fatal("strict mode should error on method call on nil")
 		}
 	})
 
@@ -926,27 +933,18 @@ func TestCoverage_EdgeCases(t *testing.T) {
 		}
 	})
 
-	t.Run("toBool branches", func(t *testing.T) {
-		if toBool(nil) {
-			t.Fatal("expected false")
+	t.Run("asBool branches", func(t *testing.T) {
+		// asBool never coerces: only a real bool passes; everything else errors.
+		if b, err := asBool(true); err != nil || !b {
+			t.Fatalf("expected true, nil; got %v, %v", b, err)
 		}
-		if !toBool(true) {
-			t.Fatal("expected true")
+		if b, err := asBool(false); err != nil || b {
+			t.Fatalf("expected false, nil; got %v, %v", b, err)
 		}
-		if toBool(0) {
-			t.Fatal("expected false")
-		}
-		if !toBool(1) {
-			t.Fatal("expected true")
-		}
-		if toBool("") {
-			t.Fatal("expected false")
-		}
-		if toBool("false") {
-			t.Fatal("expected false")
-		}
-		if !toBool("x") {
-			t.Fatal("expected true")
+		for _, v := range []any{nil, 0, 1, "", "false", "x", 1.5} {
+			if _, err := asBool(v); err == nil {
+				t.Fatalf("expected error for non-bool %v (%T)", v, v)
+			}
 		}
 	})
 

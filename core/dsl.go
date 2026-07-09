@@ -43,11 +43,20 @@ var (
 
 type CustomFunc func(args []any) (any, error)
 
+// MacroFunc is a lazy-argument function: it receives its arguments UN-evaluated
+// (as Expr) plus the current evaluation Context, so it decides whether and how
+// to evaluate them — for example re-evaluating a predicate expression once per
+// element of a collection, with the element swapped in as the Context's Data.
+// This is the extension point for collection operations (any/all/filter/map)
+// without baking any of them, or an element placeholder, into the core language.
+type MacroFunc func(ctx Context, args []Expr) (any, error)
+
 type Context struct {
-	Data any
-	Fns  map[string]CustomFunc
+	Data   any
+	Fns    map[string]CustomFunc
+	Macros map[string]MacroFunc
 	// Strict makes member/index access on a missing field, key, index, or nil
-	// value return an error instead of nil. Off by default.
+	// value return an error instead of nil. On by default (see NewEngine).
 	Strict bool
 	// MethodFilter, when non-nil, gates every reflected method and getter
 	// invocation: names for which it returns false are denied. Nil allows all.
@@ -357,8 +366,11 @@ type MethodCallExpr struct {
 
 func (e *MethodCallExpr) Eval(ctx Context) (any, error) {
 	obj, err := e.Left.Eval(ctx)
-	if err != nil || obj == nil {
+	if err != nil {
 		return nil, err
+	}
+	if obj == nil {
+		return ctx.miss("cannot call %q on nil", e.Method)
 	}
 
 	if e.Method == "len" && len(e.Args) == 0 {
@@ -403,6 +415,13 @@ type CallExpr struct {
 }
 
 func (e *CallExpr) Eval(ctx Context) (any, error) {
+	// 0. Macros receive their arguments UN-evaluated, so they must be resolved
+	// before any argument is touched. This is what lets a userland any/all/filter
+	// re-evaluate a predicate expression per collection element.
+	if m, ok := ctx.Macros[strings.ToLower(e.Name)]; ok {
+		return m(ctx, e.Args)
+	}
+
 	// 1. Try to find a global function first
 	fn, ok := ctx.Fns[strings.ToLower(e.Name)]
 	if ok {
@@ -458,12 +477,16 @@ func (e *UnaryExpr) Eval(ctx Context) (any, error) {
 	}
 	switch e.Op {
 	case "!":
-		return !toBool(rv), nil
+		b, err := asBool(rv)
+		if err != nil {
+			return nil, err
+		}
+		return !b, nil
 	case "-":
 		if i, ok := toInt64(rv); ok {
 			return -i, nil
 		}
-		if f, ok := toFloat(rv); ok {
+		if f, ok := toNumber(rv); ok {
 			return -f, nil
 		}
 		return nil, fmt.Errorf("invalid unary - for %T", rv)
@@ -494,24 +517,32 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 		return nil, err
 	}
 	if e.Op == "&&" {
-		if !toBool(lv) {
+		lb, err := asBool(lv)
+		if err != nil {
+			return nil, err
+		}
+		if !lb {
 			return false, nil
 		}
 		rv, err := e.Right.Eval(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return toBool(rv), nil
+		return asBool(rv)
 	}
 	if e.Op == "||" {
-		if toBool(lv) {
+		lb, err := asBool(lv)
+		if err != nil {
+			return nil, err
+		}
+		if lb {
 			return true, nil
 		}
 		rv, err := e.Right.Eval(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return toBool(rv), nil
+		return asBool(rv)
 	}
 	rv, err := e.Right.Eval(ctx)
 	if err != nil {
@@ -523,8 +554,18 @@ func (e *InfixExpr) Eval(ctx Context) (any, error) {
 	case "!=":
 		return !valuesEqual(lv, rv), nil
 	case "+":
+		// Strong-typed +: string+string concatenates, number+number adds; any
+		// cross-type mix is an error rather than a silent coercion. There is no
+		// asymmetric "'a' + 1" shortcut anymore.
 		if ls, ok := lv.(string); ok {
-			return ls + fmt.Sprint(rv), nil
+			rs, ok := rv.(string)
+			if !ok {
+				return nil, fmt.Errorf("invalid + between %T and %T: string + non-string", lv, rv)
+			}
+			return ls + rs, nil
+		}
+		if _, ok := rv.(string); ok {
+			return nil, fmt.Errorf("invalid + between %T and %T: non-string + string", lv, rv)
 		}
 		return evalMath(lv, rv, '+')
 	case "-":
@@ -578,8 +619,8 @@ func valuesEqual(lv, rv any) bool {
 	if reflect.DeepEqual(lv, rv) {
 		return true
 	}
-	lf, okL := toFloat(lv)
-	rf, okR := toFloat(rv)
+	lf, okL := toNumber(lv)
+	rf, okR := toNumber(rv)
 	return okL && okR && lf == rf
 }
 
@@ -641,7 +682,11 @@ func (e *TernaryExpr) Eval(ctx Context) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if toBool(cond) {
+	b, err := asBool(cond)
+	if err != nil {
+		return nil, err
+	}
+	if b {
 		return e.Then.Eval(ctx)
 	}
 	return e.Else.Eval(ctx)
@@ -712,6 +757,57 @@ func getMember(ctx Context, obj any, key string) (any, error) {
 		return ctx.miss("unknown field %q on %s", key, rv.Type())
 	}
 	return ctx.miss("cannot access %q on %T", key, obj)
+}
+
+// memberLookup resolves name on obj as a struct field, map key, or slice/array
+// index, WITHOUT invoking methods and WITHOUT strict-mode errors. It reports
+// whether the member was found (a found member whose value is nil returns
+// (nil, true)). It underlies the has()/get() builtins, the sanctioned way to
+// touch possibly-absent members now that member access is strict by default.
+func memberLookup(obj any, name string) (any, bool) {
+	if obj == nil {
+		return nil, false
+	}
+	rv := reflect.ValueOf(obj)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil, false
+		}
+		rv = rv.Elem()
+	}
+	switch rv.Kind() {
+	case reflect.Map:
+		kt := rv.Type().Key()
+		kv := reflect.ValueOf(name)
+		if !kv.Type().AssignableTo(kt) {
+			i, err := strconv.ParseInt(name, 10, 64)
+			if err != nil || !reflect.TypeOf(i).ConvertibleTo(kt) {
+				return nil, false
+			}
+			kv = reflect.ValueOf(i).Convert(kt)
+		}
+		res := rv.MapIndex(kv)
+		if !res.IsValid() {
+			return nil, false
+		}
+		return res.Interface(), true
+	case reflect.Slice, reflect.Array:
+		idx, err := strconv.Atoi(name)
+		if err != nil || idx < 0 || idx >= rv.Len() {
+			return nil, false
+		}
+		return rv.Index(idx).Interface(), true
+	case reflect.Struct:
+		meta := getStructMeta(rv.Type())
+		if path, ok := meta.fields[name]; ok {
+			fv, err := rv.FieldByIndexErr(path)
+			if err != nil {
+				return nil, false
+			}
+			return fv.Interface(), true
+		}
+	}
+	return nil, false
 }
 
 // hasMethod reports whether obj (or its addressable pointer form) has an
@@ -827,8 +923,8 @@ func evalMath(lv, rv any, op rune) (any, error) {
 			return li % ri, nil
 		}
 	}
-	lf, okL := toFloat(lv)
-	rf, okR := toFloat(rv)
+	lf, okL := toNumber(lv)
+	rf, okR := toNumber(rv)
 	if !okL || !okR {
 		return nil, fmt.Errorf("invalid arithmetic %c between %T and %T", op, lv, rv)
 	}
@@ -851,24 +947,27 @@ func evalMath(lv, rv any, op rune) (any, error) {
 }
 
 func compare(lv, rv any, op string) (bool, error) {
-	// When both sides are strings, compare lexically. (Numeric strings still
-	// compare numerically if one side is an actual number, via toFloat below.)
+	// Strong-typed comparison: both sides must be the same category — two strings
+	// (compared lexically) or two numbers (compared numerically). A string is
+	// never coerced to a number, so '10' > 5 is an error, not a silent 10 > 5.
 	if ls, ok := lv.(string); ok {
-		if rs, ok := rv.(string); ok {
-			switch op {
-			case ">":
-				return ls > rs, nil
-			case "<":
-				return ls < rs, nil
-			case ">=":
-				return ls >= rs, nil
-			case "<=":
-				return ls <= rs, nil
-			}
+		rs, ok := rv.(string)
+		if !ok {
+			return false, fmt.Errorf("invalid comparison between %T and %T", lv, rv)
+		}
+		switch op {
+		case ">":
+			return ls > rs, nil
+		case "<":
+			return ls < rs, nil
+		case ">=":
+			return ls >= rs, nil
+		case "<=":
+			return ls <= rs, nil
 		}
 	}
-	lf, okL := toFloat(lv)
-	rf, okR := toFloat(rv)
+	lf, okL := toNumber(lv)
+	rf, okR := toNumber(rv)
 	if !okL || !okR {
 		return false, fmt.Errorf("invalid comparison between %T and %T", lv, rv)
 	}
@@ -1333,7 +1432,8 @@ func lbp(t token) int {
 // -----------------------------------------------------------------------------
 
 type Engine struct {
-	funcs        atomic.Value
+	funcs        atomic.Value // holds map[string]CustomFunc
+	macros       atomic.Value // holds map[string]MacroFunc
 	maxDepth     atomic.Int64
 	strict       atomic.Bool
 	methodFilter atomic.Value // holds methodPolicy
@@ -1362,7 +1462,36 @@ func defaultFuncs() map[string]CustomFunc {
 			}
 			return int64(0), nil
 		},
-		"now":        func(args []any) (any, error) { return time.Now().Unix(), nil },
+		"now": func(args []any) (any, error) { return time.Now().Unix(), nil },
+		// has(obj, 'name') and get(obj, 'name', default) are the sanctioned way to
+		// touch a possibly-absent member now that access is strict by default. They
+		// take the member NAME as a string (has(user, 'Coupon'), not
+		// has(user.Coupon)) and resolve fields / map keys / indexes only — never
+		// methods — without triggering a strict-mode error.
+		"has": func(args []any) (any, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("has: expected 2 args (obj, name), got %d", len(args))
+			}
+			name, ok := args[1].(string)
+			if !ok {
+				return nil, fmt.Errorf("has: name must be a string, got %T", args[1])
+			}
+			_, found := memberLookup(args[0], name)
+			return found, nil
+		},
+		"get": func(args []any) (any, error) {
+			if len(args) != 3 {
+				return nil, fmt.Errorf("get: expected 3 args (obj, name, default), got %d", len(args))
+			}
+			name, ok := args[1].(string)
+			if !ok {
+				return nil, fmt.Errorf("get: name must be a string, got %T", args[1])
+			}
+			if v, found := memberLookup(args[0], name); found {
+				return v, nil
+			}
+			return args[2], nil
+		},
 		"contains":   strBinFunc("contains", strings.Contains),
 		"startswith": strBinFunc("startsWith", strings.HasPrefix),
 		"endswith":   strBinFunc("endsWith", strings.HasSuffix),
@@ -1409,10 +1538,29 @@ func (e *Engine) loadFuncs() (m map[string]CustomFunc) {
 	return e.funcs.Load().(map[string]CustomFunc)
 }
 
+func (e *Engine) loadMacros() (m map[string]MacroFunc) {
+	defer func() {
+		if recover() != nil {
+			m = map[string]MacroFunc{}
+			e.macros.Store(m)
+		}
+	}()
+	v := e.macros.Load()
+	if v == nil {
+		return map[string]MacroFunc{}
+	}
+	return v.(map[string]MacroFunc)
+}
+
 func NewEngine() *Engine {
 	e := &Engine{}
 	e.funcs.Store(defaultFuncs())
+	e.macros.Store(map[string]MacroFunc{})
 	e.maxDepth.Store(MaxStackDepth)
+	// Strict lookups are ON by default: a misspelled field, absent key, or
+	// out-of-range index is a mistake, not a silent nil. Optional members are
+	// expressed explicitly with has()/get(). Call SetStrict(false) to opt out.
+	e.strict.Store(true)
 	e.methodFilter.Store(methodPolicy{nil})
 	return e
 }
@@ -1473,19 +1621,49 @@ func (e *Engine) RegisterFunc(name string, fn CustomFunc) error {
 	return nil
 }
 
-// Program is a parsed expression bound to the Engine it was compiled on.
-// Parsing is done once; Eval can then be called repeatedly against different
-// data without re-lexing/re-parsing, which is the common rules-engine pattern
-// of evaluating one rule many times. It always reads the latest registered
-// funcs from its Engine, so RegisterFunc still takes effect after Compile.
+// RegisterMacro registers a lazy-argument function on this Engine. Unlike
+// RegisterFunc, a macro receives its arguments un-evaluated (as []Expr) plus the
+// current Context, so it can evaluate them selectively or repeatedly — the basis
+// for collection operations like any/all/filter/map. Macros are resolved before
+// plain functions and before the data-method fallback. Registration is
+// per-Engine and copy-on-write, so it is safe to call concurrently; like
+// RegisterFunc, it only affects Programs compiled after this call.
+func (e *Engine) RegisterMacro(name string, fn MacroFunc) error {
+	if name == "" {
+		return errors.New("macro name cannot be empty")
+	}
+	if fn == nil {
+		return errors.New("macro cannot be nil")
+	}
+	curr := e.loadMacros()
+	next := make(map[string]MacroFunc, len(curr)+1)
+	maps.Copy(next, curr)
+	next[strings.ToLower(name)] = fn
+	e.macros.Store(next)
+	return nil
+}
+
+// Program is a parsed expression compiled from an Engine. Parsing is done once;
+// Eval can then be called repeatedly against different data without
+// re-lexing/re-parsing, the common rules-engine pattern of evaluating one rule
+// many times.
+//
+// A Program is an immutable, self-contained artifact: the functions, macros,
+// strict flag, and method filter in effect at Compile time are SNAPSHOTTED into
+// it. Changing the Engine afterwards (RegisterFunc, SetStrict, SetMethodFilter,
+// …) does not affect Programs already compiled — they stay reproducible and are
+// safe to evaluate concurrently. To pick up new configuration, recompile.
 type Program struct {
-	ast    Expr
-	engine *Engine
+	ast          Expr
+	fns          map[string]CustomFunc
+	macros       map[string]MacroFunc
+	strict       bool
+	methodFilter func(name string) bool
 }
 
 // Compile parses exprStr once and returns a reusable Program, honoring the
-// Engine's nesting limit. Parse-time panics are recovered and returned as
-// errors, mirroring Eval.
+// Engine's nesting limit and snapshotting the Engine's current configuration.
+// Parse-time panics are recovered and returned as errors, mirroring Eval.
 func (e *Engine) Compile(exprStr string) (prog *Program, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1497,11 +1675,18 @@ func (e *Engine) Compile(exprStr string) (prog *Program, err error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Program{ast: foldConstants(ast), engine: e}, nil
+	return &Program{
+		ast:          foldConstants(ast),
+		fns:          e.loadFuncs(),
+		macros:       e.loadMacros(),
+		strict:       e.strict.Load(),
+		methodFilter: e.methodFilterFn(),
+	}, nil
 }
 
-// Eval evaluates a compiled Program against data. Evaluation panics are
-// recovered and returned as errors.
+// Eval evaluates a compiled Program against data using the configuration
+// snapshotted at Compile time. Evaluation panics are recovered and returned as
+// errors.
 func (p *Program) Eval(data any) (res any, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -1511,9 +1696,10 @@ func (p *Program) Eval(data any) (res any, err error) {
 	}()
 	return p.ast.Eval(Context{
 		Data:         data,
-		Fns:          p.engine.loadFuncs(),
-		Strict:       p.engine.strict.Load(),
-		MethodFilter: p.engine.methodFilterFn(),
+		Fns:          p.fns,
+		Macros:       p.macros,
+		Strict:       p.strict,
+		MethodFilter: p.methodFilter,
 	})
 }
 
@@ -1611,10 +1797,14 @@ func foldConstants(e Expr) Expr {
 		n.Then = foldConstants(n.Then)
 		n.Else = foldConstants(n.Else)
 		if lit, ok := n.Cond.(*LiteralExpr); ok {
-			if toBool(lit.Value) {
-				return n.Then
+			// Only fold when the constant condition is actually a bool; a non-bool
+			// constant is left intact so it surfaces the type error at Eval time.
+			if b, ok := lit.Value.(bool); ok {
+				if b {
+					return n.Then
+				}
+				return n.Else
 			}
-			return n.Else
 		}
 	case *ListExpr:
 		allLit := true
@@ -1674,13 +1864,26 @@ func toInt64(v any) (int64, bool) {
 	}
 }
 
-func toFloat(v any) (float64, bool) {
+// toNumber coerces integer and float kinds to float64. Unlike toFloat it does
+// NOT parse numeric strings: under strong typing, arithmetic and comparison
+// never treat a string (or nil) as a number.
+func toNumber(v any) (float64, bool) {
 	if i, ok := toInt64(v); ok {
 		return float64(i), true
 	}
 	rv := reflect.ValueOf(v)
 	if k := rv.Kind(); k == reflect.Float32 || k == reflect.Float64 {
 		return rv.Float(), true
+	}
+	return 0, false
+}
+
+// toFloat is like toNumber but also parses numeric strings. It is used only by
+// EvalTo, where the caller has explicitly asked to convert a result into a Go
+// numeric type — it is NOT part of the language's operator semantics.
+func toFloat(v any) (float64, bool) {
+	if f, ok := toNumber(v); ok {
+		return f, true
 	}
 	if s, ok := v.(string); ok {
 		f, err := strconv.ParseFloat(s, 64)
@@ -1689,18 +1892,14 @@ func toFloat(v any) (float64, bool) {
 	return 0, false
 }
 
-func toBool(v any) bool {
-	if v == nil {
-		return false
-	}
+// asBool requires v to already be a bool. Under the language's strong-typed,
+// fail-loud rules, conditions (?: && || !) never coerce strings, numbers, or nil
+// to a boolean — a non-bool condition is an error, not a silent truthy guess.
+func asBool(v any) (bool, error) {
 	if b, ok := v.(bool); ok {
-		return b
+		return b, nil
 	}
-	if s, ok := v.(string); ok {
-		return s != "" && !strings.EqualFold(s, "false")
-	}
-	f, _ := toFloat(v)
-	return f != 0
+	return false, fmt.Errorf("expected bool condition, got %T", v)
 }
 
 // EvalTo evaluates the expression and attempts to cast/convert the result to

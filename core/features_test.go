@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -23,7 +24,7 @@ func TestInOperatorAndListLiterals(t *testing.T) {
 		{"2 in nums", true},
 		{"9 in nums", false},
 		{"2 in [1, 2, 3]", true},
-		{"'a' in m", true},   // map key membership
+		{"'a' in m", true}, // map key membership
 		{"'z' in m", false},
 		{"'world' in s", true}, // substring
 		{"'nope' in s", false},
@@ -79,12 +80,18 @@ func TestStringOrdering(t *testing.T) {
 		{"'b' > 'a'", true},
 		{"'abc' <= 'abd'", true},
 		{"'abc' >= 'abd'", false},
-		{"'5' > 3", true}, // numeric string vs number still compares numerically
 	}
 	for _, c := range cases {
 		got, err := e.Eval(c.expr, nil)
 		if err != nil || got != c.want {
 			t.Fatalf("%s: got %v, err %v, want %v", c.expr, got, err, c.want)
+		}
+	}
+	// Strong typing: comparing a string with a number is a type error, never a
+	// silent numeric coercion. '5' > 3 no longer secretly means 5 > 3.
+	for _, src := range []string{"'5' > 3", "3 < '5'", "'10' >= 10"} {
+		if _, err := e.Eval(src, nil); err == nil {
+			t.Fatalf("%s: expected a type error for mixed string/number comparison", src)
 		}
 	}
 }
@@ -134,18 +141,24 @@ func TestStrictMode(t *testing.T) {
 		"scores": map[string]int{"x": 1},
 	}
 
-	// Non-strict (default): unknown field/key/index resolve to nil.
+	// Opt out: unknown field/key/index resolve to nil under non-strict.
+	e.SetStrict(false)
 	for _, expr := range []string{"user.Naem", "scores.missing", "user.Tags[9]"} {
 		if v, err := e.Eval(expr, data); err != nil || v != nil {
 			t.Fatalf("non-strict %s: got %v, %v", expr, v, err)
 		}
 	}
 
+	// Strict is the default; assert a fresh engine already errors on the typo.
+	if _, err := NewEngine().Eval("user.Naem", data); !errors.Is(err, ErrUnknownField) {
+		t.Fatalf("strict should be the default: got %v", err)
+	}
+
 	e.SetStrict(true)
 	strictErrs := []string{
-		"user.Naem",       // misspelled field
-		"scores.missing",  // absent map key
-		"user.Tags[9]",    // out of range
+		"user.Naem",        // misspelled field
+		"scores.missing",   // absent map key
+		"user.Tags[9]",     // out of range
 		"user.Tags[9] > 0", // propagates through operators
 	}
 	for _, expr := range strictErrs {
@@ -299,6 +312,7 @@ func TestEmbeddedFields(t *testing.T) {
 
 	// A promoted field through a nil embedded pointer must not panic.
 	u2 := EmbUser{EmbMeta: nil, Name: "x"}
+	e.SetStrict(false)
 	if got, err := e.Eval("u.kind", map[string]any{"u": u2}); err != nil || got != nil {
 		t.Fatalf("nil embedded ptr (non-strict): got %v, err %v", got, err)
 	}
@@ -489,7 +503,13 @@ func TestUnexportedFieldIsSafe(t *testing.T) {
 	if got, err := e.Eval("o.Name", data); err != nil || got != "x" {
 		t.Fatalf("exported field: got %v, %v", got, err)
 	}
-	// Accessing the unexported field must not panic; it simply resolves to nil.
+	// Strict (default): the unexported field is not exposed; it errors cleanly
+	// (never panics, never leaks the value).
+	if _, err := e.Eval("o.secret", data); !errors.Is(err, ErrUnknownField) {
+		t.Fatalf("unexported field (strict): expected ErrUnknownField, got %v", err)
+	}
+	// Non-strict: it simply resolves to nil, still never panicking or leaking.
+	e.SetStrict(false)
 	if got, err := e.Eval("o.secret", data); err != nil || got != nil {
 		t.Fatalf("unexported field: got %v, %v", got, err)
 	}
@@ -553,16 +573,23 @@ func TestSetMaxNestingDepth(t *testing.T) {
 	}
 }
 
-// --- toBool case-insensitivity ------------------------------------------------
+// --- strong-typed conditions: strings are never coerced to bool ---------------
 
-func TestToBoolCaseInsensitiveFalse(t *testing.T) {
-	for _, s := range []string{"false", "False", "FALSE"} {
-		if toBool(s) {
-			t.Fatalf("toBool(%q) should be false", s)
+func TestStringConditionErrors(t *testing.T) {
+	e := NewEngine()
+	// Under strong typing, a string (or number, or nil) as a condition is a type
+	// error, not a silent truthy/falsy guess. No more "'0' is truthy" footgun.
+	for _, src := range []string{
+		"'false' ? 1 : 2",
+		"'0' ? 1 : 2",
+		"'x' ? 1 : 2",
+		"5 ? 1 : 2",
+		"'a' && true",
+		"!'x'",
+	} {
+		if _, err := e.Eval(src, nil); err == nil {
+			t.Fatalf("%s: expected a bool-condition type error", src)
 		}
-	}
-	if !toBool("0") { // non-empty, not "false"
-		t.Fatal(`toBool("0") should be true`)
 	}
 }
 
@@ -588,7 +615,14 @@ func TestStringRoundTrip(t *testing.T) {
 
 // evalAST is a tiny test helper to evaluate a pre-built AST with default funcs.
 func (e *Engine) evalAST(ast Expr) (any, error) {
-	return (&Program{ast: ast, engine: NewEngine()}).Eval(nil)
+	src := NewEngine()
+	return (&Program{
+		ast:          ast,
+		fns:          src.loadFuncs(),
+		macros:       src.loadMacros(),
+		strict:       src.strict.Load(),
+		methodFilter: src.methodFilterFn(),
+	}).Eval(nil)
 }
 
 // --- panic safety: nothing ever escapes as a panic ----------------------------
@@ -613,4 +647,188 @@ func FuzzEvalNeverPanics(f *testing.F) {
 		}
 		_, _ = ParseExpr(expr)
 	})
+}
+
+// --- has()/get(): the sanctioned way to touch possibly-absent members ---------
+
+func TestHasGet(t *testing.T) {
+	e := NewEngine() // strict is on by default
+	type coupon struct{ Code string }
+	type user struct {
+		Name   string
+		Coupon *coupon
+	}
+	data := map[string]any{
+		"user":   user{Name: "Alice", Coupon: nil},
+		"scores": map[string]int{"math": 90},
+	}
+
+	cases := []struct {
+		expr string
+		want any
+	}{
+		{"has(user, 'Name')", true},
+		{"has(user, 'Nope')", false},
+		{"has(scores, 'math')", true},
+		{"has(scores, 'science')", false},
+		{"get(scores, 'math', 0)", 90},            // found value keeps its Go type (map[string]int)
+		{"get(scores, 'science', -1)", int64(-1)}, // default is a DSL int64 literal
+		{"get(user, 'Name', 'x')", "Alice"},
+		// Optional field expressed explicitly instead of relying on silent nil.
+		{"has(user, 'Coupon') ? 'has' : 'none'", "has"}, // key present (value is nil ptr)
+		{"has(scores, 'bonus') ? get(scores, 'bonus', 0) : 0", int64(0)},
+	}
+	for _, c := range cases {
+		got, err := e.Eval(c.expr, data)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v (%T), err %v, want %v", c.expr, got, got, err, c.want)
+		}
+	}
+
+	// has/get take the member NAME as a string, and never invoke methods.
+	if _, err := e.Eval("has(user, 123)", data); err == nil {
+		t.Fatal("has with non-string name should error")
+	}
+}
+
+// --- RegisterMacro: collection ops live in userland, not the core -------------
+
+// registerAnyAll installs userland any/all macros. A macro receives its args
+// un-evaluated, so it can re-evaluate the predicate once per element with the
+// element swapped in as the Context's Data (the element-scoping convention is
+// the macro's choice, not the language's).
+func registerAnyAll(t *testing.T, e *Engine) {
+	t.Helper()
+	quantify := func(all bool) MacroFunc {
+		return func(ctx Context, args []Expr) (any, error) {
+			if len(args) != 2 {
+				return nil, fmt.Errorf("any/all: expected 2 args")
+			}
+			coll, err := args[0].Eval(ctx)
+			if err != nil {
+				return nil, err
+			}
+			rv := reflect.ValueOf(coll)
+			if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+				return nil, fmt.Errorf("any/all: not a collection: %T", coll)
+			}
+			for i := 0; i < rv.Len(); i++ {
+				child := ctx
+				child.Data = rv.Index(i).Interface()
+				v, err := args[1].Eval(child)
+				if err != nil {
+					return nil, err
+				}
+				b, err := asBool(v)
+				if err != nil {
+					return nil, err
+				}
+				if all && !b {
+					return false, nil
+				}
+				if !all && b {
+					return true, nil
+				}
+			}
+			return all, nil
+		}
+	}
+	if err := e.RegisterMacro("any", quantify(false)); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.RegisterMacro("all", quantify(true)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegisterMacroAnyAll(t *testing.T) {
+	e := NewEngine()
+	registerAnyAll(t, e)
+
+	data := map[string]any{
+		"orders": []map[string]any{
+			{"price": int64(50), "fresh": true},
+			{"price": int64(150), "fresh": false},
+		},
+	}
+	// This macro's element-scoping convention: the predicate is evaluated with the
+	// element as the root, so a bare field name (price, fresh) refers to the
+	// element. That is the macro author's choice; the core language stays neutral.
+	cases := []struct {
+		expr string
+		want any
+	}{
+		{"any(orders, price > 100)", true},
+		{"all(orders, price > 100)", false},
+		{"any(orders, fresh)", true}, // element field used directly as a bool condition
+		{"any(orders, price == 50)", true},
+		{"all(orders, price >= 50)", true},
+	}
+	for _, c := range cases {
+		got, err := e.Eval(c.expr, data)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v (%T), err %v, want %v", c.expr, got, got, err, c.want)
+		}
+	}
+
+	// A macro is resolved before a plain function of the same name would be, and
+	// before the data-method fallback; unknown names still error.
+	if _, err := e.Eval("nope(orders, price > 100)", data); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown call: expected ErrNotFound, got %v", err)
+	}
+}
+
+// --- Program immutability: config is snapshotted at Compile -------------------
+
+func TestProgramConfigSnapshot(t *testing.T) {
+	e := NewEngine()
+	data := map[string]any{"user": map[string]any{"Name": "x"}}
+
+	// Compiled while strict (default): flipping strict afterwards must not change it.
+	strictProg, err := e.Compile("user.Nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.SetStrict(false)
+	if _, err := strictProg.Eval(data); !errors.Is(err, ErrUnknownField) {
+		t.Fatalf("snapshot: strict program should still error, got %v", err)
+	}
+	// A program compiled now (non-strict) resolves the typo to nil.
+	lenientProg, err := e.Compile("user.Nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.SetStrict(true) // change again: must not affect the already-compiled program
+	if v, err := lenientProg.Eval(data); err != nil || v != nil {
+		t.Fatalf("snapshot: lenient program should stay lenient, got %v, %v", v, err)
+	}
+}
+
+// --- nil is allowed to exist and be consumed, but errors when used in an op ----
+
+func TestNilOnUse(t *testing.T) {
+	e := NewEngine()
+	data := map[string]any{
+		"m": map[string]any{"x": nil}, // present key whose value is nil
+	}
+
+	// nil can be a final result and can be consumed by get/has.
+	if v, err := e.Eval("get(m, 'x', 'dflt')", data); err != nil || v != nil {
+		t.Fatalf("get present-nil: got %v, %v (want nil)", v, err)
+	}
+	if v, err := e.Eval("has(m, 'x')", data); err != nil || v != true {
+		t.Fatalf("has present-nil: got %v, %v", v, err)
+	}
+
+	// But taking that nil into an operation is an error, never a silent 0/false.
+	for _, src := range []string{
+		"m.x + 1",     // arithmetic
+		"m.x > 0",     // comparison
+		"m.x ? 1 : 2", // condition
+		"m.x.y",       // further member access
+	} {
+		if _, err := e.Eval(src, data); err == nil {
+			t.Fatalf("%s: expected an error using nil in an operation", src)
+		}
+	}
 }

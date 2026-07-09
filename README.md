@@ -39,7 +39,7 @@ func main() {
 | Kind | DSL syntax | Runtime type (Go) | Example | Example result |
 |---|---|---|---|---|
 | Boolean | `true` / `false` | `bool` | `true && false` | `false` |
-| String | `'...'` (single quotes) | `string` | `'hi\n' + 1` | `"hi\n1"` |
+| String | `'...'` (single quotes) | `string` | `'hi' + ' there'` | `"hi there"` |
 | Integer | `123`, `0xFF`, `1_000` | `int64` | `123 + 1` | `int64(124)` |
 | Float | `1.25`, `1e3`, `1.5e2` | `float64` | `1.25 * 2` | `float64(2.5)` |
 
@@ -83,8 +83,8 @@ Identifiers may contain Unicode letters, so non-ASCII field and map-key names wo
 | `struct` / `*struct` | `user.Method(args...)` | Method call via reflection | `user.SayHi('hi')` |
 | `struct` / `*struct` | `user.Method` | Getter-style: only if method has **0 inputs** and **>=1 outputs** | `user.MultiReturn` |
 | `map[K]V` | `m.key` or `m[key]` | `key` is a string; if `K` is numeric, Okra tries to parse numeric keys from strings | `scores.1`, `scores[1]` |
-| `[]T` / `[N]T` | `arr.0` or `arr[0]` | Index access; invalid/out-of-range returns `nil` | `nums.1`, `nums[1]` |
-| pointers | auto-dereference | Nil pointers usually yield `nil` (except some special cases like `len`) | `ptr.Field`, `ptr.Method()` |
+| `[]T` / `[N]T` | `arr.0` or `arr[0]` | Index access; invalid/out-of-range is an error in strict mode (the default), else `nil` | `nums.1`, `nums[1]` |
+| pointers | auto-dereference | Nil pointers are an error in strict mode (the default), else `nil` (except special cases like `len`) | `ptr.Field`, `ptr.Method()` |
 
 Field promotion follows Go's rules: a directly-declared field shadows a promoted one of the same name (reach the shadowed field explicitly, e.g. `user.Base.Name`). Only **exported** embedded structs are traversed — reflecting through an unexported field would panic — and a promoted field reached through a `nil` embedded pointer resolves to `nil` (or errors in strict mode).
 
@@ -101,6 +101,8 @@ Okra supports bracket indexing like `arr[0]` and it also supports **index expres
 |---|---|---|---|---|
 | `len` | `len(x) -> int64`; `len() -> int64(0)` | `slice` / `array` / `string` / `map` (pointers are dereferenced; other types return `int64(0)`) | `len(tags)`, `len()` | `int64(2)`, `int64(0)` |
 | `now` | `now() -> int64` | none | `now()` | Unix seconds |
+| `has` | `has(obj, name) -> bool` | `name` is a string field/map-key/index name; resolves fields, map keys, indexes (never methods) without a strict-mode error | `has(user, 'Coupon')` | `true` / `false` |
+| `get` | `get(obj, name, default) -> any` | as `has`; returns the member if present, otherwise `default` | `get(scores, 'math', 0)` | value or `default` |
 | `contains` | `contains(s, sub) -> bool` | strings (non-strings coerced via `fmt.Sprint`) | `contains('hello', 'ell')` | `true` |
 | `startsWith` | `startsWith(s, prefix) -> bool` | strings | `startsWith('hello', 'he')` | `true` |
 | `endsWith` | `endsWith(s, suffix) -> bool` | strings | `endsWith('hello', 'lo')` | `true` |
@@ -133,6 +135,56 @@ v, err := e.Eval("add(1, 2)", nil)
 // v == int64(3)
 ```
 
+Registration is per-`Engine` and only affects `Program`s compiled **after** the call
+(see [Compiling Once](#compiling-once-evaluating-many-times) — a `Program` snapshots
+its functions at `Compile` time).
+
+## Lazy Functions / Macros (`RegisterMacro`)
+
+`RegisterFunc` receives its arguments already evaluated. A **macro** instead receives
+its arguments **un-evaluated** (as `[]Expr`) plus the current `Context`, so it can
+choose whether and how to evaluate them — including re-evaluating a predicate once per
+element of a collection. This is the extension point for collection operations
+(`any` / `all` / `filter` / `map`); the core language deliberately ships none of them,
+nor any element placeholder, so you build exactly the semantics you want.
+
+```go
+type MacroFunc func(ctx core.Context, args []core.Expr) (any, error)
+```
+
+A macro is resolved **before** a plain function of the same name and before the
+data-method fallback. Example: an `any(coll, predicate)` that evaluates `predicate`
+with each element swapped in as the root data (so a bare field name refers to the
+element — an element-scoping convention chosen by *this* macro, not the language):
+
+```go
+e.RegisterMacro("any", func(ctx core.Context, args []core.Expr) (any, error) {
+    coll, err := args[0].Eval(ctx)
+    if err != nil {
+        return nil, err
+    }
+    rv := reflect.ValueOf(coll)
+    for i := 0; i < rv.Len(); i++ {
+        child := ctx
+        child.Data = rv.Index(i).Interface() // re-root at the element
+        v, err := args[1].Eval(child)
+        if err != nil {
+            return nil, err
+        }
+        if b, ok := v.(bool); ok && b {
+            return true, nil
+        }
+    }
+    return false, nil
+})
+
+// any(orders, price > 100)  ->  true if some order's price exceeds 100
+```
+
+Like `RegisterFunc`, `RegisterMacro` is per-`Engine` and only affects `Program`s
+compiled after the call. Because a macro exposes `Expr`/`Context`, treat those types as
+part of your integration's stable surface.
+
 ## List Literals and the `in` Operator
 
 List literals use square brackets and can hold any expressions: `[1, 2, 3]`, `['a', 'b']`, `[]`. They evaluate to `[]any`.
@@ -151,68 +203,84 @@ The `in` operator (and its negation `not in`) tests membership and never panics.
 status in ['active', 'trial'] ? 1 : 0
 ```
 
-## Operators and Type Coercion
+## Operators and Types
 
-Okra uses three internal coercions:
+Okra is **strongly typed and fail-loud**: it never silently coerces one type into
+another to make an operation "work". Mixing types that don't belong together is an
+error, not a guessed value. This keeps a rule's meaning stable when the data's type
+shifts (e.g. a value that was an `int` arrives as a `string`).
 
-- `toInt64`: supports all signed/unsigned integer kinds
-- `toFloat`: supports integers, floats, and strings that parse via `ParseFloat`
-- `toBool`: supports `bool`, strings (`""` and any case of `"false"` are false), otherwise `toFloat(v) != 0`
+Numbers are the one unified family: all signed/unsigned integer kinds and both float
+kinds interoperate (integer path when both operands are int-like, otherwise float
+path). A **string is never treated as a number**, and **`nil` used in any operation is
+an error** (see [nil](#nil)).
 
 ### Arithmetic: `+ - * / %`
 
-| Operator | Supported types | Rule (simplified) | Example | Example result |
-|---|---|---|---|---|
-| `+` | number + number | integer path if both are int-like; otherwise float path | `1 + 2`, `1.5 + 2` | `int64(3)`, `3.5` |
-| `+` | string + any | if LHS is `string`, concatenates `fmt.Sprint(rhs)` | `'res:' + 10` | `"res:10"` |
-| `- * /` | numbers | integer path if possible; otherwise float path | `10 - 3`, `2.0 * 3.5` | `int64(7)`, `7.0` |
-| `/` | numbers | division by zero returns `ErrDivByZero` | `10 / 0` | error |
-| `%` | integers | modulo by zero returns `ErrModByZero`; float modulo returns `ErrFloatModulo` | `10 % 3`, `1.2 % 2.0` | `int64(1)`, error |
+| Operator | Rule | Example | Example result |
+|---|---|---|---|
+| `+` (numbers) | integer path if both int-like, else float path | `1 + 2`, `1.5 + 2` | `int64(3)`, `3.5` |
+| `+` (strings) | **string + string** concatenates; any string/number mix is an error | `'a' + 'b'`, `'res:' + 10` | `"ab"`, **error** |
+| `- * /` | numbers only | `10 - 3`, `2.0 * 3.5` | `int64(7)`, `7.0` |
+| `/` | division by zero → `ErrDivByZero` | `10 / 0` | error |
+| `%` | integers; `ErrModByZero`, float modulo → `ErrFloatModulo` | `10 % 3`, `1.2 % 2.0` | `int64(1)`, error |
 
-If either operand cannot be coerced to a number (and it is not string concatenation), arithmetic returns an error rather than silently yielding `0`.
+An operand that is not a number (a string, `nil`, …) makes arithmetic an error rather
+than silently yielding `0`.
 
 ### Comparison: `> < >= <=`
 
-| Operator | Supported types | Rule | Example | Example result |
-|---|---|---|---|---|
-| `> < >= <=` | two strings, or both `toFloat`-convertible | two strings compare lexically; otherwise numeric; else error | `'a' < 'b'`, `10.5 > 10` | `true`, `true` |
+Both operands must be the **same category** — two strings (compared lexically) or two
+numbers (compared numerically). A string is never coerced to a number.
+
+| Example | Result |
+|---|---|
+| `'a' < 'b'` | `true` (lexical) |
+| `10.5 > 10` | `true` (numeric) |
+| `'10' > 5` | **error** (string vs number) |
 
 ### Equality: `== !=`
 
-| Operator | Supported types | Rule | Example | Example result |
-|---|---|---|---|---|
-| `==` | any | `DeepEqual` first; else numeric compare when **both sides are numbers**; else `false` | `10 == 10.0`, `1 == '1'` | `true`, `false` |
-| `!=` | any | negation of `==` | `10 != 10.0`, `'1' != 1` | `false`, `true` |
+| Operator | Rule | Example | Example result |
+|---|---|---|---|
+| `==` | `DeepEqual` first; else numeric compare when **both sides are numbers**; else `false` | `10 == 10.0`, `1 == '1'` | `true`, `false` |
+| `!=` | negation of `==` | `10 != 10.0`, `'1' != 1` | `false`, `true` |
 
-A string is never considered numerically equal to a number (`1 == '1'` is `false`), though two numbers of different kinds still compare by value (`10 == 10.0` is `true`).
+Equality is the one place mixed types are allowed without error: they simply compare
+unequal. A string is never numerically equal to a number (`1 == '1'` is `false`),
+while two numbers of different kinds compare by value (`10 == 10.0` is `true`).
 
 ### Logical: `&& ||` (short-circuit)
 
+Both operands must be **`bool`** — there is no truthiness coercion. A non-bool operand
+(string, number, `nil`) is a type error.
+
 | Operator | Rule | Example | Example result |
 |---|---|---|---|
-| `&&` | if LHS is false, RHS is not evaluated | `false && (1/0)` | `false` (no error) |
-| `||` | if LHS is true, RHS is not evaluated | `true || (1/0)` | `true` (no error) |
+| `&&` | if LHS is `false`, RHS is not evaluated | `false && (1/0)` | `false` (no error) |
+| `||` | if LHS is `true`, RHS is not evaluated | `true || (1/0)` | `true` (no error) |
+| — | non-bool operand | `'x' && true`, `1 || false` | error |
 
 ### Unary: `! - ~`
 
-| Operator | Supported types | Rule | Example | Example result |
-|---|---|---|---|---|
-| `!x` | any | `!toBool(x)` | `!true` | `false` |
-| `-x` | numbers | supports int/float; otherwise error | `-1`, `-1.5` | `int64(-1)`, `-1.5` |
-| `~x` | integers | bitwise not on `int64` | `~0` | `int64(-1)` |
+| Operator | Rule | Example | Example result |
+|---|---|---|---|
+| `!x` | requires `bool` (no coercion) | `!true`, `!'x'` | `false`, **error** |
+| `-x` | numbers only | `-1`, `-1.5` | `int64(-1)`, `-1.5` |
+| `~x` | integers | `~0` | `int64(-1)` |
 
 ### Bitwise: `& | ^ << >>`
 
-| Operator | Supported types | Rule | Example | Example result |
-|---|---|---|---|---|
-| `& | ^` | integers | both sides must be int-like | `5 & 3`, `5 ^ 1` | `int64(1)`, `int64(4)` |
-| `<< >>` | integers | shift count must be >= 0 | `1 << 3`, `1 << -1` | `int64(8)`, error |
+| Operator | Rule | Example | Example result |
+|---|---|---|---|
+| `& | ^` | integers, both int-like | `5 & 3`, `5 ^ 1` | `int64(1)`, `int64(4)` |
+| `<< >>` | integers, shift count `>= 0` | `1 << 3`, `1 << -1` | `int64(8)`, error |
 
 ## Ternary Operator: `cond ? then : else`
 
 | Syntax | Rule | Example | Example result |
 |---|---|---|---|
-| `a ? b : c` | condition uses `toBool`; evaluates only one branch (short-circuit) | `true ? 1 : 2` | `int64(1)` |
+| `a ? b : c` | condition must be `bool` (no coercion); evaluates only one branch | `true ? 1 : 2` | `int64(1)` |
 
 ## Compiling Once, Evaluating Many Times
 
@@ -230,7 +298,16 @@ for _, order := range orders {
 }
 ```
 
-A `Program` always reads the Engine's latest registered functions, so `RegisterFunc` still takes effect after `Compile`. At compile time, sub-expressions built entirely from literals are **constant-folded** (e.g. `1 + 2 * 3` becomes the literal `7`), so they are not recomputed on every `Eval`. A subtree that errors when folded (like `1 / 0`) is left intact so the error still surfaces at eval time.
+A `Program` is an **immutable, self-contained artifact**: the functions, macros,
+strict flag, and method filter in effect at `Compile` time are snapshotted into it.
+Changing the Engine afterwards (`RegisterFunc`, `SetStrict`, `SetMethodFilter`, …) does
+**not** affect Programs already compiled — they stay reproducible and are safe to
+evaluate concurrently. To pick up new configuration, recompile.
+
+At compile time, sub-expressions built entirely from literals are **constant-folded**
+(e.g. `1 + 2 * 3` becomes the literal `7`), so they are not recomputed on every `Eval`.
+A subtree that errors when folded (like `1 / 0`) is left intact so the error still
+surfaces at eval time.
 
 ### Inspecting a Program
 
@@ -252,7 +329,7 @@ prog.Funcs() // ["contains"]
 Okra never crashes the host application — every public entry point (`Eval`, `Compile`, `Program.Eval`, `EvalTo`, `ParseExpr`) recovers panics and returns them as errors.
 
 - If evaluation hits a `panic` (from reflection/type conversions or inside user methods), Okra **recovers** and returns it as an `error`.
-- Unexported struct fields are never exposed (reading them via reflection would panic), so `obj.unexportedField` simply resolves to `nil`.
+- Unexported struct fields are never exposed (reading them via reflection would panic). Like any unknown field, `obj.unexportedField` is an error in strict mode (the default) and resolves to `nil` when strict is off — it is never leaked either way.
 
 ### Sentinel Errors
 
@@ -266,12 +343,45 @@ Several errors are exported so callers can match them with `errors.Is`, even tho
 
 ### Strict Mode
 
-By default a missing field, absent map key, out-of-range index, or member access on `nil` resolves to `nil` (so a misspelled field is silent). Enable strict mode to turn these into errors instead:
+Strict mode is **on by default**. A missing struct field, absent map key,
+out-of-range index, or member/method access on `nil` is an **error**
+(`ErrUnknownField`), so a misspelled field fails loudly on the first evaluation rather
+than silently resolving to `nil` and steering the rule down the wrong branch:
 
 ```go
-e.SetStrict(true)
+e := core.NewEngine()               // strict by default
 _, err := e.Eval("user.Naem", data) // errors.Is(err, ErrUnknownField)
 ```
+
+Express a genuinely optional member explicitly with [`has` / `get`](#built-in-functions)
+instead of relying on silent `nil`:
+
+```okra
+has(user, 'Coupon') ? user.Coupon.Code : 'none'
+get(scores, 'bonus', 0)
+```
+
+To restore the old lenient behavior (missing → `nil`), opt out per Engine:
+
+```go
+e.SetStrict(false)
+```
+
+### nil
+
+There is **no `null` literal** in the language — you cannot write one, and the type
+system has no null. But `nil` values do arrive from the host: a map that holds `nil`, a
+method that returns `nil`, or `get(obj, name, default)`. Okra's rule is **nil may exist
+but not be *used***:
+
+- A `nil` may be the **final result** of an expression (handed back to your Go caller,
+  which can deal with it) and may be **consumed** by `has` / `get`.
+- A `nil` that enters any **operation** — arithmetic, comparison, concatenation, a
+  `?:` / `&&` / `||` / `!` condition, or a further member access — is an **error**,
+  never a silent `0` / `false`.
+
+This complements strict mode: *missing* is an error at access time; a present *nil
+value* is fine to pass around, but *using* it in an operation is an error.
 
 ### Restricting Methods
 
