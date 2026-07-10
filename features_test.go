@@ -1072,3 +1072,64 @@ func TestGetterErrorsSurface(t *testing.T) {
 		t.Fatalf("expected recovered panic naming the getter, got %v", err)
 	}
 }
+
+// --- `in` fast paths must agree with valuesEqual exactly -------------------------
+
+func TestInFastPathSemantics(t *testing.T) {
+	e := NewEngine()
+	data := map[string]any{
+		"i64s": []int64{1, 2, 3},
+		"ints": []int{1, 2, 3},
+		"f64s": []float64{1.0, 2.5},
+		"strs": []string{"a", "b"},
+	}
+	cases := []struct {
+		expr string
+		want any
+	}{
+		// int64 needle, exact match path
+		{"2 in i64s", true},
+		{"9 in i64s", false},
+		// float needle against int64/int elements: numeric cross-kind compare
+		{"2.0 in i64s", true},
+		{"2.5 in i64s", false},
+		{"2.0 in ints", true},
+		// int needle against float elements
+		{"1 in f64s", true},
+		{"2 in f64s", false},
+		{"2.5 in f64s", true},
+		// a string never equals a number, in either direction
+		{"'2' in i64s", false},
+		{"'2' in ints", false},
+		{"'1' in f64s", false},
+		{"2 in strs", false},
+		// string membership
+		{"'a' in strs", true},
+		{"'z' in strs", false},
+		// bools are not numbers
+		{"true in i64s", false},
+	}
+	for _, c := range cases {
+		got, err := e.Eval(c.expr, data)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v, err %v, want %v", c.expr, got, err, c.want)
+		}
+	}
+
+	// The fast-path scan must stay cancellable (per-element steps).
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := e.RegisterFunc("cancelnow2", func([]any) (any, error) {
+		cancel()
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	big := make([]int64, 100_000)
+	prog, err := e.Compile("cancelnow2() && (1 in big)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := prog.EvalContext(ctx, map[string]any{"big": big}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("fast-path scan should be cancellable, got %v", err)
+	}
+}

@@ -777,6 +777,82 @@ func evalIn(ctx Context, needle, haystack any) (any, error) {
 		}
 		rv = rv.Elem()
 	}
+	// Typed fast paths for the common scalar slices. The generic reflect scan
+	// below boxes every element through rv.Index(i).Interface() — one heap
+	// allocation per element, which dominates large scans. Each fast path
+	// mirrors valuesEqual's semantics for its element type exactly: a string
+	// needle never matches numbers (and vice versa), non-numeric needles never
+	// match numeric elements, and numeric cross-kind comparison goes through
+	// the same toNumber float compare the generic path uses.
+	switch h := haystack.(type) {
+	case []string:
+		s, ok := needle.(string)
+		if !ok {
+			return false, nil
+		}
+		for _, el := range h {
+			if err := ctx.step(); err != nil {
+				return nil, err
+			}
+			if el == s {
+				return true, nil
+			}
+		}
+		return false, nil
+	case []int64:
+		if n, ok := needle.(int64); ok {
+			for _, el := range h {
+				if err := ctx.step(); err != nil {
+					return nil, err
+				}
+				if el == n {
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+		nf, ok := toNumber(needle)
+		if !ok { // strings, bools, nil: never equal to a number
+			return false, nil
+		}
+		for _, el := range h {
+			if err := ctx.step(); err != nil {
+				return nil, err
+			}
+			if float64(el) == nf {
+				return true, nil
+			}
+		}
+		return false, nil
+	case []int:
+		nf, ok := toNumber(needle)
+		if !ok { // strings, bools, nil: never equal to a number
+			return false, nil
+		}
+		for _, el := range h {
+			if err := ctx.step(); err != nil {
+				return nil, err
+			}
+			if float64(el) == nf {
+				return true, nil
+			}
+		}
+		return false, nil
+	case []float64:
+		nf, ok := toNumber(needle)
+		if !ok { // strings, bools, nil: never equal to a number
+			return false, nil
+		}
+		for _, el := range h {
+			if err := ctx.step(); err != nil {
+				return nil, err
+			}
+			if el == nf {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
 	switch rv.Kind() {
 	case reflect.Slice, reflect.Array:
 		for i := 0; i < rv.Len(); i++ {
@@ -841,6 +917,15 @@ func (e *TernaryExpr) String() string {
 func getMember(ctx Context, obj any, key string) (any, error) {
 	if obj == nil {
 		return ctx.miss("cannot access %q on nil", key)
+	}
+	// Fast path: map[string]any is the dominant data shape (JSON-like root
+	// objects). A direct lookup skips reflect.ValueOf / MapIndex / Interface
+	// and their per-access allocations; semantics match the reflect path below.
+	if m, ok := obj.(map[string]any); ok {
+		if v, found := m[key]; found {
+			return v, nil
+		}
+		return ctx.miss("map has no key %q", key)
 	}
 	rv := reflect.ValueOf(obj)
 	for rv.Kind() == reflect.Pointer {
@@ -908,6 +993,11 @@ func getMember(ctx Context, obj any, key string) (any, error) {
 func memberLookup(obj any, name string) (any, bool) {
 	if obj == nil {
 		return nil, false
+	}
+	// Same map[string]any fast path as getMember.
+	if m, ok := obj.(map[string]any); ok {
+		v, found := m[name]
+		return v, found
 	}
 	rv := reflect.ValueOf(obj)
 	for rv.Kind() == reflect.Pointer {
