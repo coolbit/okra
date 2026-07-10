@@ -1108,19 +1108,128 @@ func callReflectMethod(obj any, name string, args []any) (any, error) {
 		} else {
 			t = mType.In(i)
 		}
-		if arg == nil {
-			in[i] = reflect.Zero(t)
-		} else {
-			v := reflect.ValueOf(arg)
-			if v.Type().ConvertibleTo(t) {
-				in[i] = v.Convert(t)
-			} else {
-				return nil, fmt.Errorf("method %s arg %d: cannot use %T as %v", name, i, arg, t)
-			}
+		cv, err := convertArg(arg, t)
+		if err != nil {
+			return nil, fmt.Errorf("method %s arg %d: %w", name, i, err)
 		}
+		in[i] = cv
 	}
 
 	return invokeMethod(mv, in, name)
+}
+
+// convertArg converts a DSL value to a method parameter type, refusing lossy
+// conversions. The language is fail-loud everywhere else; the reflected method
+// boundary must not be the one place where an int64 silently wraps into an
+// int8, a float is truncated into an int, or 65 turns into the string "A".
+func convertArg(arg any, t reflect.Type) (reflect.Value, error) {
+	if arg == nil {
+		return reflect.Zero(t), nil
+	}
+	v := reflect.ValueOf(arg)
+	if v.Type().AssignableTo(t) {
+		return v, nil
+	}
+	if !v.Type().ConvertibleTo(t) {
+		return reflect.Value{}, fmt.Errorf("cannot use %T as %v", arg, t)
+	}
+	switch t.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		i, err := exactInt64(v)
+		if err != nil {
+			return reflect.Value{}, fmt.Errorf("cannot use %v (%T) as %v: %w", arg, arg, t, err)
+		}
+		z := reflect.New(t).Elem()
+		if z.OverflowInt(i) {
+			return reflect.Value{}, fmt.Errorf("cannot use %v (%T) as %v: value out of range", arg, arg, t)
+		}
+		z.SetInt(i)
+		return z, nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		u, err := exactUint64(v)
+		if err != nil {
+			return reflect.Value{}, fmt.Errorf("cannot use %v (%T) as %v: %w", arg, arg, t, err)
+		}
+		z := reflect.New(t).Elem()
+		if z.OverflowUint(u) {
+			return reflect.Value{}, fmt.Errorf("cannot use %v (%T) as %v: value out of range", arg, arg, t)
+		}
+		z.SetUint(u)
+		return z, nil
+	case reflect.Float32, reflect.Float64:
+		f, ok := toNumber(arg)
+		if !ok {
+			return reflect.Value{}, fmt.Errorf("cannot use %v (%T) as %v", arg, arg, t)
+		}
+		z := reflect.New(t).Elem()
+		if z.OverflowFloat(f) {
+			return reflect.Value{}, fmt.Errorf("cannot use %v (%T) as %v: value out of range", arg, arg, t)
+		}
+		z.SetFloat(f)
+		return z, nil
+	case reflect.String:
+		// Go's int→string conversion produces a rune string ("A" from 65) —
+		// never what a rule author means. Only real strings (and byte/rune
+		// slices) convert to string parameters.
+		if v.Kind() == reflect.String ||
+			(v.Kind() == reflect.Slice && (v.Type().Elem().Kind() == reflect.Uint8 || v.Type().Elem().Kind() == reflect.Int32)) {
+			return v.Convert(t), nil
+		}
+		return reflect.Value{}, fmt.Errorf("cannot use %v (%T) as %v", arg, arg, t)
+	}
+	// Non-numeric, non-string conversions (e.g. []byte↔string handled above,
+	// named types of the same underlying kind) are Go-meaningful; allow them.
+	return v.Convert(t), nil
+}
+
+// exactInt64 extracts an int64 from a numeric reflect.Value only when the
+// value is exactly representable: unsigned values must fit, floats must be
+// whole and in range.
+func exactInt64(v reflect.Value) (int64, error) {
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int(), nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		u := v.Uint()
+		if u > math.MaxInt64 {
+			return 0, errors.New("value out of range")
+		}
+		return int64(u), nil
+	case reflect.Float32, reflect.Float64:
+		f := v.Float()
+		if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) {
+			return 0, errors.New("not an integer")
+		}
+		if f < -9223372036854775808.0 || f >= 9223372036854775808.0 {
+			return 0, errors.New("value out of range")
+		}
+		return int64(f), nil
+	}
+	return 0, errors.New("not a number")
+}
+
+// exactUint64 is exactInt64's unsigned counterpart; negatives are refused.
+func exactUint64(v reflect.Value) (uint64, error) {
+	switch v.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		i := v.Int()
+		if i < 0 {
+			return 0, errors.New("value out of range")
+		}
+		return uint64(i), nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint(), nil
+	case reflect.Float32, reflect.Float64:
+		f := v.Float()
+		if math.IsNaN(f) || math.IsInf(f, 0) || f != math.Trunc(f) {
+			return 0, errors.New("not an integer")
+		}
+		if f < 0 || f >= 18446744073709551616.0 {
+			return 0, errors.New("value out of range")
+		}
+		return uint64(f), nil
+	}
+	return 0, errors.New("not a number")
 }
 
 // invokeMethod calls mv with in, recovering panics and honoring a trailing

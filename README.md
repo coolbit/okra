@@ -80,7 +80,7 @@ Identifiers may contain Unicode letters, so non-ASCII field and map-key names wo
 | Input type | Access | Notes | Example |
 |---|---|---|---|
 | `struct` / `*struct` | `user.Field` | Field access, including `okra` / `json` tag names; fields promoted from **exported embedded** structs are reachable too | `user.Name`, `user.name_tag`, `user.EmbeddedID` |
-| `struct` / `*struct` | `user.Method(args...)` | Method call via reflection | `user.SayHi('hi')` |
+| `struct` / `*struct` | `user.Method(args...)` | Method call via reflection; arguments convert **losslessly only** — an int that doesn't fit the parameter's range, a fractional float passed to an integer parameter, or a number passed to a string parameter is an error, never a silent wrap/truncate/rune-string | `user.SayHi('hi')` |
 | `struct` / `*struct` | `user.Method` | Getter-style: only if method has **0 inputs** and **>=1 outputs**; a trailing `error` return surfaces exactly as it would for `user.Method()` | `user.MultiReturn` |
 | `map[K]V` | `m.key` or `m[key]` | `key` is a string; if `K` is numeric, Okra tries to parse numeric keys from strings | `scores.1`, `scores[1]` |
 | `[]T` / `[N]T` | `arr.0` or `arr[0]` | Index access; invalid/out-of-range is an error in strict mode (the default), else `nil` | `nums.1`, `nums[1]` |

@@ -1133,3 +1133,53 @@ func TestInFastPathSemantics(t *testing.T) {
 		t.Fatalf("fast-path scan should be cancellable, got %v", err)
 	}
 }
+
+// --- lossless method-argument conversion -----------------------------------------
+
+type narrowObj struct{}
+
+func (narrowObj) TakeInt8(v int8) int8          { return v }
+func (narrowObj) TakeInt(v int) int             { return v }
+func (narrowObj) TakeUint(v uint) uint          { return v }
+func (narrowObj) TakeFloat32(v float32) float32 { return v }
+func (narrowObj) TakeFloat64(v float64) float64 { return v }
+func (narrowObj) TakeString(s string) string    { return s }
+
+func TestMethodArgConversionIsLossless(t *testing.T) {
+	e := NewEngine()
+	data := map[string]any{"o": narrowObj{}}
+
+	// Value-preserving conversions still work.
+	ok := []struct {
+		expr string
+		want any
+	}{
+		{"o.TakeInt8(100) == 100", true},
+		{"o.TakeInt(2.0) == 2", true}, // whole float → int is exact
+		{"o.TakeUint(7) == 7", true},
+		{"o.TakeFloat64(1) == 1.0", true}, // int → float is fine
+		{"o.TakeFloat32(1.5) == 1.5", true},
+		{"o.TakeString('hi') == 'hi'", true},
+	}
+	for _, c := range ok {
+		got, err := e.Eval(c.expr, data)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v, err %v", c.expr, got, err)
+		}
+	}
+
+	// Lossy conversions error instead of silently wrapping/truncating.
+	bad := []string{
+		"o.TakeInt8(300)",      // wraps to 44 under plain Convert
+		"o.TakeInt8(0 - 300)",  // negative overflow
+		"o.TakeInt(1.9)",       // fractional part truncated under Convert
+		"o.TakeUint(0 - 1)",    // negative → huge uint under Convert
+		"o.TakeFloat32(1e300)", // overflows float32 to +Inf
+		"o.TakeString(65)",     // Go int→string rune conversion ("A")
+	}
+	for _, src := range bad {
+		if _, err := e.Eval(src, data); err == nil {
+			t.Fatalf("%s: expected a lossy-conversion error", src)
+		}
+	}
+}
