@@ -1,0 +1,2 @@
+go test fuzz v1
+string("!'\xe3\xd0\x11\xb8\xa0'")

@@ -1,0 +1,2 @@
+go test fuzz v1
+string("!'\U000edd6d\U000ed8ed\U000edd6d\U000ed8ed'")

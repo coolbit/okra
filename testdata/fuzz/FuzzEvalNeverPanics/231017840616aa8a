@@ -1,0 +1,2 @@
+go test fuzz v1
+string("'\xf3\x9f\x9f\xf3\x9f\x9f\xf3\x9f\x9f\U000df45f'%''")

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // --- `in` operator + list literals --------------------------------------------
@@ -1181,5 +1182,87 @@ func TestMethodArgConversionIsLossless(t *testing.T) {
 		if _, err := e.Eval(src, data); err == nil {
 			t.Fatalf("%s: expected a lossy-conversion error", src)
 		}
+	}
+}
+
+// --- time.Time support ------------------------------------------------------------
+
+func TestTimeSupport(t *testing.T) {
+	e := NewEngine()
+	utc := time.Date(2026, 1, 15, 12, 0, 0, 0, time.UTC)
+	earlier := utc.Add(-time.Hour)
+	tokyo := utc.In(time.FixedZone("JST", 9*3600)) // same instant, different zone
+	data := map[string]any{
+		"created": utc,
+		"earlier": earlier,
+		"tokyo":   tokyo,
+		"ptr":     &utc,
+	}
+
+	cases := []struct {
+		expr string
+		want any
+	}{
+		// chronological comparison
+		{"created > earlier", true},
+		{"earlier < created", true},
+		{"created >= created", true},
+		{"created <= earlier", false},
+		// instant-based equality: same moment in another zone IS equal
+		// (reflect.DeepEqual would say false; time.Time.Equal says true)
+		{"created == tokyo", true},
+		{"created != tokyo", false},
+		{"created == earlier", false},
+		// *time.Time works like time.Time
+		{"ptr == created", true},
+		{"ptr > earlier", true},
+		// date() literals
+		{"created > date('2026-01-01')", true},
+		{"created < date('2027-01-01')", true},
+		{"date('2026-01-15 12:00:00') == created", true},
+		{"date('2026-01-15T12:00:00Z') == created", true},
+		// unix() bridges times to numbers explicitly
+		{"unix(created) - unix(earlier)", int64(3600)},
+		{"now() - unix(created) > 0", true}, // "now" is after 2026-01-15 in tests
+	}
+	for _, c := range cases {
+		got, err := e.Eval(c.expr, data)
+		if err != nil || got != c.want {
+			t.Fatalf("%s: got %v, err %v, want %v", c.expr, got, err, c.want)
+		}
+	}
+
+	// A time never mixes implicitly: comparing or doing arithmetic with a
+	// non-time errors — the explicit bridges are date() and unix().
+	for _, src := range []string{
+		"created > 100",
+		"created > '2026-01-01'", // no implicit string→time parsing
+		"created + 1",
+		"unix(5)",        // unix wants a time
+		"date(20260101)", // date wants a string
+		"date('not a date')",
+	} {
+		if _, err := e.Eval(src, data); err == nil {
+			t.Fatalf("%s: expected an error", src)
+		}
+	}
+
+	// A time is a value like any other for equality-with-non-time: unequal.
+	if v, err := e.Eval("created == 1", data); err != nil || v != false {
+		t.Fatalf("time == number: got %v, %v", v, err)
+	}
+}
+
+// --- expression length cap ---------------------------------------------------------
+
+func TestExpressionLengthLimit(t *testing.T) {
+	e := NewEngine()
+	huge := "1 + " + strings.Repeat("0 + ", MaxExprLen/4) + "0"
+	if _, err := e.Compile(huge); err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("expected length-limit error, got %v", err)
+	}
+	// A normal-size expression is unaffected.
+	if _, err := e.Compile("1 + 2"); err != nil {
+		t.Fatal(err)
 	}
 }

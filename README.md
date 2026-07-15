@@ -101,6 +101,8 @@ Okra supports bracket indexing like `arr[0]` and it also supports **index expres
 |---|---|---|---|---|
 | `len` | `len(x) -> int64` | `slice` / `array` / `string` / `map` (pointers are dereferenced); any other type — or no argument — is an **error** | `len(tags)`, `len(5)` | `int64(2)`, error |
 | `now` | `now() -> int64` | none | `now()` | Unix seconds |
+| `date` | `date(s) -> time.Time` | a string in RFC3339, `'2006-01-02 15:04:05'`, or `'2006-01-02'`; anything else errors. The explicit way to write a time literal — a bare string never implicitly becomes a time | `date('2026-01-01')` | `time.Time` |
+| `unix` | `unix(t) -> int64` | `time.Time` / non-nil `*time.Time`; the explicit bridge from times to numbers | `now() - unix(order.PaidAt) < 3600` | Unix seconds |
 | `has` | `has(obj, name) -> bool` | `name` is a string field/map-key/index name; resolves fields, map keys, indexes (never methods) without a strict-mode error. **Structural**: true if the member is there, even when its value is nil | `has(user, 'Coupon')` | `true` / `false` |
 | `get` | `get(obj, name, default) -> any` | as `has`, but **value-level**: a missing member *or* a nil value both yield `default`, so `get(...)` is always safe to feed into an operation | `get(scores, 'math', 0)` | value or `default` |
 | `contains` | `contains(s, sub) -> bool` | strings only (no coercion) | `contains('hello', 'ell')` | `true` |
@@ -265,6 +267,18 @@ them: `[1] == [1.0]` is `true`, `['1'] == [1]` is `false`, and length mismatch
 short-circuits to `false`. Other composites (maps, structs) fall back to
 `reflect.DeepEqual`. Self-referential data is safe (past a depth limit the comparison
 falls back to `DeepEqual`, which handles cycles).
+
+### Times (`time.Time`)
+
+`time.Time` values (and non-nil `*time.Time`) are first-class in comparison and
+equality:
+
+- `> < >= <=` compare **chronologically**: `user.CreatedAt > date('2026-01-01')`.
+- `==` / `!=` compare **by instant** (`time.Time.Equal`), so the same moment in two
+  timezones is equal — `DeepEqual` would wrongly disagree.
+- Everything else stays explicit and fail-loud: a time never mixes with numbers or
+  strings implicitly. `created > '2026-01-01'` and `created + 1` are errors; the
+  bridges are `date(s)` (string → time) and `unix(t)` (time → seconds).
 
 ### Logical: `&& ||` (short-circuit)
 
@@ -450,9 +464,11 @@ allowed := map[string]bool{"FullName": true, "Age": true}
 e.SetMethodFilter(func(name string) bool { return allowed[name] })
 ```
 
-### Nesting Depth
+### Nesting Depth and Expression Size
 
 Parser recursion (and therefore AST and evaluation depth) is bounded to keep deeply nested input from exhausting the stack. The default limit is `MaxStackDepth` (256); override it per Engine with `e.SetMaxNestingDepth(n)`. Exceeding it returns an `expression nesting too deep` error.
+
+A single expression is also capped at `MaxExprLen` (1 MiB) so a pathologically huge input cannot tie up the lexer; longer input returns an `expression too long` error at compile time.
 
 ## Examples
 

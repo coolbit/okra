@@ -721,6 +721,16 @@ func valuesEqualAt(lv, rv any, depth int) bool {
 	if isStringVal(lv) || isStringVal(rv) {
 		return false
 	}
+	// Times compare by instant (time.Time.Equal), so the same moment in two
+	// timezones is equal — reflect.DeepEqual would wrongly say otherwise. A
+	// time never equals a non-time.
+	if lt, lok := asTime(lv); lok {
+		rt, rok := asTime(rv)
+		return rok && lt.Equal(rt)
+	}
+	if _, rok := asTime(rv); rok {
+		return false
+	}
 	// Lists compare element-wise so scalar equality lifts into them.
 	lrv, rrv := reflect.ValueOf(lv), reflect.ValueOf(rv)
 	if isSeqKind(lrv.Kind()) && isSeqKind(rrv.Kind()) {
@@ -1328,7 +1338,42 @@ func evalMath(lv, rv any, op rune) (any, error) {
 	return nil, nil
 }
 
+// asTime extracts a time.Time from v, accepting the value form and a non-nil
+// pointer (struct fields are often *time.Time). A nil *time.Time is not a
+// time — downstream it becomes a normal type error, consistent with
+// nil-on-use.
+func asTime(v any) (time.Time, bool) {
+	switch t := v.(type) {
+	case time.Time:
+		return t, true
+	case *time.Time:
+		if t != nil {
+			return *t, true
+		}
+	}
+	return time.Time{}, false
+}
+
 func compare(lv, rv any, op string) (bool, error) {
+	// Times compare chronologically (instant-based, timezone-insensitive).
+	// Mixing a time with a non-time is an error like any cross-category
+	// comparison — convert explicitly with unix(t) to compare against numbers.
+	if lt, ok := asTime(lv); ok {
+		rt, ok := asTime(rv)
+		if !ok {
+			return false, fmt.Errorf("invalid comparison between %T and %T", lv, rv)
+		}
+		switch op {
+		case ">":
+			return lt.After(rt), nil
+		case "<":
+			return lt.Before(rt), nil
+		case ">=":
+			return !lt.Before(rt), nil
+		case "<=":
+			return !lt.After(rt), nil
+		}
+	}
 	// Strong-typed comparison: both sides must be the same category — two strings
 	// (compared lexically) or two numbers (compared numerically). A string is
 	// never coerced to a number, so '10' > 5 is an error, not a silent 10 > 5.
@@ -1846,6 +1891,35 @@ func defaultFuncs() map[string]CustomFunc {
 			return nil, fmt.Errorf("len: unsupported type %T", args[0])
 		},
 		"now": func(args []any) (any, error) { return time.Now().Unix(), nil },
+		// date('2026-01-01') parses a string into a time.Time so rules can
+		// compare against date literals: user.CreatedAt > date('2026-01-01').
+		// Parsing is explicit — a bare string never implicitly becomes a time.
+		"date": func(args []any) (any, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("date: expected 1 arg, got %d", len(args))
+			}
+			s, ok := args[0].(string)
+			if !ok {
+				return nil, fmt.Errorf("date: expected string, got %T", args[0])
+			}
+			for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
+				if t, err := time.Parse(layout, s); err == nil {
+					return t, nil
+				}
+			}
+			return nil, fmt.Errorf("date: cannot parse %q (want RFC3339, '2006-01-02 15:04:05', or '2006-01-02')", s)
+		},
+		// unix(t) converts a time.Time to Unix seconds, the explicit bridge
+		// between times and numbers: now() - unix(order.PaidAt) < 3600.
+		"unix": func(args []any) (any, error) {
+			if len(args) != 1 {
+				return nil, fmt.Errorf("unix: expected 1 arg, got %d", len(args))
+			}
+			if t, ok := asTime(args[0]); ok {
+				return t.Unix(), nil
+			}
+			return nil, fmt.Errorf("unix: expected time value, got %T", args[0])
+		},
 		// has(obj, 'name') and get(obj, 'name', default) are the sanctioned way to
 		// touch a possibly-absent member now that access is strict by default. They
 		// take the member NAME as a string (has(user, 'Coupon'), not
@@ -2402,6 +2476,11 @@ func EvalTo[T any](e *Engine, exprStr string, data any) (out T, retErr error) {
 	return zero, fmt.Errorf("result type %T is not compatible with target type %T", raw, zero)
 }
 
+// MaxExprLen bounds the byte length of a single expression accepted by
+// Compile/Eval/ParseExpr. Nesting depth is limited separately; this cap stops
+// a pathologically huge input from tying up the lexer and memory.
+const MaxExprLen = 1 << 20 // 1 MiB
+
 // parseWithDepth parses s with the given nesting limit. Any panic is recovered
 // and returned as an error so parsing can never crash the caller.
 func parseWithDepth(s string, maxDepth int) (ast Expr, err error) {
@@ -2411,6 +2490,9 @@ func parseWithDepth(s string, maxDepth int) (ast Expr, err error) {
 			err = fmt.Errorf("panic: %v", r)
 		}
 	}()
+	if len(s) > MaxExprLen {
+		return nil, fmt.Errorf("expression too long (%d bytes, max %d)", len(s), MaxExprLen)
+	}
 	p := newParser(s, maxDepth)
 	ast, err = p.parse(0, 0)
 	if err != nil {

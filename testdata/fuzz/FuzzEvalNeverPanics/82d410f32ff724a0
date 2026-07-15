@@ -1,0 +1,2 @@
+go test fuzz v1
+string("''%'\u07b5\u05f6\u07b6\xe5\xafъ\xe1\xa5˕ƁʪƲє\u0601܋\xed\x8e\xee\xa6؍ĩ\xe4\xb8և\xe7\x86\xf0\xbbއ\u07b5\u07b5\u07b5\u05f6\u07b6\u07b5\u07b5\u07b5\u05f5\u07b5'")
